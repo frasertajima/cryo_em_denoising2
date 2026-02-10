@@ -1,0 +1,142 @@
+!================================================================
+! Test Fourier Loss Module
+!================================================================
+! Verifies the fourier_loss module works correctly with
+! batched image data in the same format as cryo_train.
+!================================================================
+
+program test_fourier_loss
+    use cudafor
+    use fourier_loss
+    implicit none
+
+    integer, parameter :: WIDTH = 64
+    integer, parameter :: HEIGHT = 64
+    integer, parameter :: BATCH = 2
+
+    real(4), device, allocatable :: d_pred(:,:,:,:)
+    real(4), device, allocatable :: d_target(:,:,:,:)
+    real(4), allocatable :: h_pred(:,:,:,:)
+    real(4), allocatable :: h_target(:,:,:,:)
+
+    real(4) :: loss
+    integer :: i, j, b
+    real(4) :: pi = 3.14159265
+
+    print *, "========================================"
+    print *, "Test Fourier Loss Module"
+    print *, "========================================"
+    print *, ""
+
+    ! Allocate in (W, H, C, N) format matching training code
+    allocate(h_pred(WIDTH, HEIGHT, 1, BATCH))
+    allocate(h_target(WIDTH, HEIGHT, 1, BATCH))
+    allocate(d_pred(WIDTH, HEIGHT, 1, BATCH))
+    allocate(d_target(WIDTH, HEIGHT, 1, BATCH))
+
+    ! Initialize module
+    call init_fourier_loss(WIDTH, HEIGHT)
+    print *, ""
+
+    !----------------------------------------
+    ! Test 1: Identical images = zero loss
+    !----------------------------------------
+    print *, "Test 1: Identical images (should be ~0 loss)"
+    do b = 1, BATCH
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                h_pred(i, j, 1, b) = sin(2.0 * pi * 4.0 * real(i-1) / real(WIDTH))
+                h_target(i, j, 1, b) = h_pred(i, j, 1, b)
+            end do
+        end do
+    end do
+    d_pred = h_pred
+    d_target = h_target
+
+    call compute_fourier_loss(d_pred, d_target, BATCH, loss)
+    print '(A,E12.4)', "  Fourier loss: ", loss
+    if (loss < 1.0e-10) then
+        print *, "  PASS: Loss is essentially zero"
+    else
+        print *, "  WARNING: Expected zero loss"
+    end if
+    print *, ""
+
+    !----------------------------------------
+    ! Test 2: Different frequencies = high loss
+    !----------------------------------------
+    print *, "Test 2: Different frequencies (freq 4 vs freq 8)"
+    do b = 1, BATCH
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                h_pred(i, j, 1, b) = sin(2.0 * pi * 4.0 * real(i-1) / real(WIDTH))
+                h_target(i, j, 1, b) = sin(2.0 * pi * 8.0 * real(i-1) / real(WIDTH))
+            end do
+        end do
+    end do
+    d_pred = h_pred
+    d_target = h_target
+
+    call compute_fourier_loss(d_pred, d_target, BATCH, loss)
+    print '(A,E12.4)', "  Fourier loss: ", loss
+    if (loss > 0.0) then
+        print *, "  PASS: Non-zero loss for different frequencies"
+    else
+        print *, "  FAIL: Expected non-zero loss"
+    end if
+    print *, ""
+
+    !----------------------------------------
+    ! Test 3: Noisy vs clean (realistic scenario)
+    !----------------------------------------
+    print *, "Test 3: Noisy prediction vs clean target"
+    do b = 1, BATCH
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                ! Clean target: low frequency pattern
+                h_target(i, j, 1, b) = sin(2.0 * pi * 2.0 * real(i-1) / real(WIDTH)) * &
+                                       sin(2.0 * pi * 2.0 * real(j-1) / real(HEIGHT))
+                ! Noisy prediction: target + high-freq noise
+                h_pred(i, j, 1, b) = h_target(i, j, 1, b) + &
+                                     0.1 * sin(2.0 * pi * 20.0 * real(i-1) / real(WIDTH))
+            end do
+        end do
+    end do
+    d_pred = h_pred
+    d_target = h_target
+
+    call compute_fourier_loss(d_pred, d_target, BATCH, loss)
+    print '(A,E12.4)', "  Fourier loss (noisy vs clean): ", loss
+    print *, "  (Loss should penalize high-freq noise)"
+    print *, ""
+
+    !----------------------------------------
+    ! Test 4: Slightly blurred vs clean
+    !----------------------------------------
+    print *, "Test 4: Slightly different amplitude"
+    do b = 1, BATCH
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                h_target(i, j, 1, b) = sin(2.0 * pi * 4.0 * real(i-1) / real(WIDTH))
+                h_pred(i, j, 1, b) = 0.9 * h_target(i, j, 1, b)  ! 10% amplitude loss
+            end do
+        end do
+    end do
+    d_pred = h_pred
+    d_target = h_target
+
+    call compute_fourier_loss(d_pred, d_target, BATCH, loss)
+    print '(A,E12.4)', "  Fourier loss (90% amplitude): ", loss
+    print *, ""
+
+    ! Cleanup
+    call destroy_fourier_loss()
+
+    deallocate(h_pred, h_target)
+    deallocate(d_pred, d_target)
+
+    print *, "========================================"
+    print *, "All tests completed!"
+    print *, "========================================"
+
+end program test_fourier_loss

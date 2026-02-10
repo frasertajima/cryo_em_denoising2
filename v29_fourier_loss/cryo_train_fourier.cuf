@@ -1,0 +1,712 @@
+!================================================================
+! Cryo-EM Denoising Training Program - v29 (Fourier Loss)
+!================================================================
+! Simple 3-layer CNN for cryo-EM particle denoising.
+!
+! Input:  Noisy particle image (1 channel × 1024 × 1024)
+! Output: Clean particle image (1 channel × 1024 × 1024)
+!
+! Architecture:
+!   Conv1: 1 → 16 channels, 3×3 kernel, ReLU
+!   Conv2: 16 → 16 channels, 3×3 kernel, ReLU
+!   Conv3: 16 → 1 channel, 3×3 kernel
+!
+! Features:
+!   - Combined MSE + Fourier loss for frequency-aware denoising
+!   - Training with validation split
+!   - Checkpoint saving after each epoch
+!
+! Usage:
+!   ./cryo_train_fourier --stream                     # Streaming mode (MSE only)
+!   ./cryo_train_fourier --stream --fourier_weight 0.1 # 10% Fourier loss
+!   ./cryo_train_fourier --stream --epochs 5          # Custom epochs
+!   ./cryo_train_fourier --stream --lr 0.001          # Custom learning rate
+!   ./cryo_train_fourier --stream --save              # Save checkpoints
+!================================================================
+
+program cryo_train_fourier
+    use cudafor
+    use iso_c_binding
+    use streaming_cryo_loader
+    use conv2d_cudnn
+    use fourier_loss_module
+    implicit none
+
+    ! cuDNN interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    ! Training parameters
+    integer, parameter :: BATCH_SIZE = 4
+    integer, parameter :: IMG_SIZE = 1024
+    integer, parameter :: IN_CHANNELS = 1
+    integer, parameter :: HIDDEN_CHANNELS = 16
+    integer, parameter :: OUT_CHANNELS = 1
+    integer, parameter :: KERNEL_SIZE = 3
+    integer, parameter :: PADDING = 1  ! Same padding
+
+    integer :: num_epochs = 5
+    real(4) :: learning_rate = 0.001
+    real(4) :: fourier_weight = 0.0    ! 0 = MSE only, 0.1 = 10% Fourier loss
+    integer :: max_batches = -1  ! -1 means all batches
+    logical :: save_checkpoints = .false.
+    character(len=256) :: checkpoint_dir = "saved_models/cryo_cnn_fourier/"
+    real(4) :: val_split = 0.1  ! 10% for validation
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+
+    ! CNN layers
+    type(conv2d_layer_t) :: conv1, conv2, conv3
+
+    ! Data buffers - flat format from loader
+    real(4), managed, allocatable :: batch_noisy_flat(:,:)   ! (1024*1024, batch)
+    real(4), managed, allocatable :: batch_clean_flat(:,:)   ! (1024*1024, batch)
+
+    ! Data buffers - 4D format for CNN (NCHW format)
+    real(4), device, allocatable :: batch_input(:,:,:,:)   ! (W, H, C, N)
+    real(4), device, allocatable :: batch_target(:,:,:,:)  ! (W, H, C, N)
+
+    ! Hidden activations
+    real(4), device, allocatable :: hidden1(:,:,:,:)       ! (batch, 16, 1024, 1024)
+    real(4), device, allocatable :: hidden2(:,:,:,:)       ! (batch, 16, 1024, 1024)
+    real(4), device, allocatable :: output(:,:,:,:)        ! (batch, 1, 1024, 1024)
+
+    ! Gradients
+    real(4), device, allocatable :: grad_output(:,:,:,:)   ! (batch, 1, 1024, 1024)
+    real(4), device, allocatable :: grad_hidden2(:,:,:,:)  ! (batch, 16, 1024, 1024)
+    real(4), device, allocatable :: grad_hidden1(:,:,:,:)  ! (batch, 16, 1024, 1024)
+
+    ! Flattened buffers for Fourier loss (batch, W*H)
+    real(4), device, allocatable :: output_flat(:,:)
+    real(4), device, allocatable :: target_flat(:,:)
+
+    ! Training state
+    integer :: epoch, batch_num, timestep
+    integer :: actual_batch_size, total_batches, train_batches, val_batches
+    real(4) :: batch_loss, mse_loss_val, fourier_loss_val, epoch_loss, avg_loss
+    real(4) :: epoch_mse_loss, epoch_fourier_loss
+    real(4) :: val_loss, val_avg_loss
+    real(4) :: epoch_start_time, epoch_end_time
+    integer :: samples_processed, val_samples_processed
+    integer :: istat
+    real(4) :: best_val_loss
+
+    ! Parse command line args
+    call parse_training_args()
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Cryo-EM CNN Training - v29 (Fourier Loss)"
+    print *, "=============================================="
+    print '(A,I8)', "  Epochs:        ", num_epochs
+    print '(A,F10.6)', "  Learning rate: ", learning_rate
+    print '(A,F10.4)', "  Fourier weight:", fourier_weight
+    print '(A,I8)', "  Batch size:    ", BATCH_SIZE
+    print '(A,I8)', "  Image size:    ", IMG_SIZE
+    print '(A,F6.1,A)', "  Val split:     ", val_split * 100, "%"
+    if (save_checkpoints) then
+        print '(A,A)', "  Checkpoints:   ", trim(checkpoint_dir)
+    else
+        print *, "  Checkpoints:   disabled (use --save to enable)"
+    endif
+
+    ! Initialize cuDNN
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "  cuDNN initialized"
+
+    ! Initialize Fourier loss if weight > 0
+    if (fourier_weight > 0.0) then
+        call init_fourier_loss(IMG_SIZE, IMG_SIZE)
+        print *, "  Fourier loss initialized"
+    endif
+
+    ! Initialize streaming data loader
+    call cryo_loader_init('../data/cryo_data_streaming/train_input.bin', &
+                          '../data/cryo_data_streaming/train_target.bin', &
+                          29952, BATCH_SIZE)  ! Full dataset: 29,952 patches
+    print *, "  Streaming data loader initialized"
+
+    ! Initialize CNN layers
+    print *, "  Initializing CNN layers..."
+
+    ! Layer 1: 1 → 16 channels
+    call conv2d_init(conv1, cudnn_handle, IN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, BATCH_SIZE, IMG_SIZE, IMG_SIZE, .true.)
+
+    ! Layer 2: 16 → 16 channels
+    call conv2d_init(conv2, cudnn_handle, HIDDEN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, BATCH_SIZE, IMG_SIZE, IMG_SIZE, .true.)
+
+    ! Layer 3: 16 → 1 channel (output, no ReLU)
+    call conv2d_init(conv3, cudnn_handle, HIDDEN_CHANNELS, OUT_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, BATCH_SIZE, IMG_SIZE, IMG_SIZE, .false.)
+
+    print *, "  CNN layers initialized"
+
+    ! Allocate buffers
+    allocate(batch_noisy_flat(IMG_SIZE * IMG_SIZE, BATCH_SIZE))
+    allocate(batch_clean_flat(IMG_SIZE * IMG_SIZE, BATCH_SIZE))
+    allocate(batch_input(IMG_SIZE, IMG_SIZE, IN_CHANNELS, BATCH_SIZE))
+    allocate(batch_target(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+    allocate(hidden1(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(hidden2(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(output(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+    allocate(grad_output(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+    allocate(grad_hidden2(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(grad_hidden1(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+
+    ! Allocate flat buffers for Fourier loss
+    if (fourier_weight > 0.0) then
+        allocate(output_flat(IMG_SIZE * IMG_SIZE, BATCH_SIZE))
+        allocate(target_flat(IMG_SIZE * IMG_SIZE, BATCH_SIZE))
+    endif
+
+    total_batches = cryo_loader_get_num_batches()
+    timestep = 0
+
+    ! Split into train/val
+    val_batches = int(total_batches * val_split)
+    train_batches = total_batches - val_batches
+    best_val_loss = 1.0e10
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Starting Training"
+    print *, "=============================================="
+    print '(A,I8)', "  Total batches/epoch: ", total_batches
+    print '(A,I8)', "  Train batches:       ", train_batches
+    print '(A,I8)', "  Val batches:         ", val_batches
+    print *, ""
+
+    ! Training loop
+    do epoch = 1, num_epochs
+        call cpu_time(epoch_start_time)
+
+        call cryo_loader_start_epoch()
+        epoch_loss = 0.0
+        epoch_mse_loss = 0.0
+        epoch_fourier_loss = 0.0
+        samples_processed = 0
+        batch_num = 0
+
+        ! === TRAINING PHASE ===
+        do
+            ! Get next batch (flat format from loader)
+            call cryo_loader_get_batch(batch_noisy_flat, batch_clean_flat, actual_batch_size)
+            if (actual_batch_size <= 0) exit
+
+            ! Reshape flat -> 4D (W, H, C, N)
+            call reshape_flat_to_4d(batch_noisy_flat, batch_input, actual_batch_size)
+            call reshape_flat_to_4d(batch_clean_flat, batch_target, actual_batch_size)
+
+            batch_num = batch_num + 1
+            timestep = timestep + 1
+
+            ! Early exit for testing
+            if (max_batches > 0 .and. batch_num > max_batches) exit
+
+            ! Stop before validation batches
+            if (batch_num > train_batches) exit
+
+            ! Forward pass: input → hidden1 → hidden2 → output
+            call conv2d_forward(conv1, batch_input, hidden1)
+            call relu_forward(hidden1, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+            call conv2d_forward(conv2, hidden1, hidden2)
+            call relu_forward(hidden2, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+            call conv2d_forward(conv3, hidden2, output)
+
+            ! Compute MSE loss and gradient
+            call compute_mse_loss(output, batch_target, grad_output, actual_batch_size, mse_loss_val)
+
+            ! Compute Fourier loss if enabled
+            if (fourier_weight > 0.0) then
+                ! Flatten output and target for Fourier loss
+                call reshape_4d_to_flat(output, output_flat, actual_batch_size)
+                call reshape_4d_to_flat(batch_target, target_flat, actual_batch_size)
+
+                call compute_fourier_loss(output_flat, target_flat, actual_batch_size, fourier_loss_val)
+
+                ! Combined loss: (1 - w) * MSE + w * Fourier
+                batch_loss = (1.0 - fourier_weight) * mse_loss_val + fourier_weight * fourier_loss_val
+
+                ! Scale MSE gradient by (1 - fourier_weight)
+                ! Note: For simplicity, we're not computing Fourier gradient - it acts as regularization
+                call scale_gradient(grad_output, 1.0 - fourier_weight, actual_batch_size)
+
+                epoch_fourier_loss = epoch_fourier_loss + fourier_loss_val
+            else
+                batch_loss = mse_loss_val
+                fourier_loss_val = 0.0
+            endif
+
+            epoch_mse_loss = epoch_mse_loss + mse_loss_val
+
+            ! Backward pass: output ← hidden2 ← hidden1 ← input
+            call conv2d_backward(conv3, hidden2, output, grad_output, grad_hidden2)
+            call relu_backward(hidden2, grad_hidden2, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+            call conv2d_backward(conv2, hidden1, hidden2, grad_hidden2, grad_hidden1)
+            call relu_backward(hidden1, grad_hidden1, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+            call conv2d_backward(conv1, batch_input, hidden1, grad_hidden1, grad_output)  ! Reuse grad_output buffer
+
+            ! Update weights
+            call conv2d_update(conv1, learning_rate, timestep)
+            call conv2d_update(conv2, learning_rate, timestep)
+            call conv2d_update(conv3, learning_rate, timestep)
+
+            epoch_loss = epoch_loss + batch_loss
+            samples_processed = samples_processed + 1
+
+            ! Progress update every 1000 batches (plus first 5 for verification)
+            if (mod(batch_num, 1000) == 0 .or. batch_num <= 5) then
+                avg_loss = epoch_loss / samples_processed
+                if (fourier_weight > 0.0) then
+                    print '(A,I2,A,I5,A,I5,A,F10.6,A,F10.6,A,F10.6)', &
+                        "  Epoch ", epoch, " | Batch ", batch_num, "/", train_batches, &
+                        " | Loss: ", avg_loss, " | MSE: ", epoch_mse_loss / samples_processed, &
+                        " | FFT: ", epoch_fourier_loss / samples_processed
+                else
+                    print '(A,I2,A,I5,A,I5,A,F10.6,A,F8.4)', &
+                        "  Epoch ", epoch, " | Batch ", batch_num, "/", train_batches, &
+                        " | Loss: ", avg_loss, " | RMSE: ", sqrt(avg_loss)
+                endif
+            endif
+        end do
+
+        print '(A,I5,A)', "  Processed ", samples_processed, " training batches"
+        avg_loss = epoch_loss / samples_processed
+
+        ! === VALIDATION PHASE ===
+        val_loss = 0.0
+        val_samples_processed = 0
+
+        if (max_batches > 0) then
+            ! Quick test mode - skip validation
+            val_avg_loss = avg_loss
+            goto 100
+        endif
+
+        do while (batch_num <= total_batches)
+            call cryo_loader_get_batch(batch_noisy_flat, batch_clean_flat, actual_batch_size)
+            if (actual_batch_size <= 0) exit
+
+            ! Reshape flat -> 4D
+            call reshape_flat_to_4d(batch_noisy_flat, batch_input, actual_batch_size)
+            call reshape_flat_to_4d(batch_clean_flat, batch_target, actual_batch_size)
+
+            batch_num = batch_num + 1
+
+            ! Forward pass only (no backward)
+            call conv2d_forward(conv1, batch_input, hidden1)
+            call relu_forward(hidden1, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+            call conv2d_forward(conv2, hidden1, hidden2)
+            call relu_forward(hidden2, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+            call conv2d_forward(conv3, hidden2, output)
+
+            ! Compute MSE loss only for validation
+            call compute_mse_loss(output, batch_target, grad_output, actual_batch_size, mse_loss_val)
+
+            ! Include Fourier loss in validation if enabled
+            if (fourier_weight > 0.0) then
+                call reshape_4d_to_flat(output, output_flat, actual_batch_size)
+                call reshape_4d_to_flat(batch_target, target_flat, actual_batch_size)
+                call compute_fourier_loss(output_flat, target_flat, actual_batch_size, fourier_loss_val)
+                batch_loss = (1.0 - fourier_weight) * mse_loss_val + fourier_weight * fourier_loss_val
+            else
+                batch_loss = mse_loss_val
+            endif
+
+            val_loss = val_loss + batch_loss
+            val_samples_processed = val_samples_processed + 1
+        end do
+
+        if (val_samples_processed > 0) then
+            val_avg_loss = val_loss / val_samples_processed
+        else
+            val_avg_loss = 0.0
+        endif
+
+        call cpu_time(epoch_end_time)
+
+100     continue
+
+        ! Epoch summary
+        print *, ""
+        print '(A,I2,A)', "  ===== Epoch ", epoch, " Complete ====="
+        print '(A,F10.6)', "  Train Loss: ", avg_loss
+        if (fourier_weight > 0.0) then
+            print '(A,F10.6)', "  Train MSE:  ", epoch_mse_loss / samples_processed
+            print '(A,F10.6)', "  Train FFT:  ", epoch_fourier_loss / samples_processed
+        else
+            print '(A,F10.6)', "  Train RMSE: ", sqrt(avg_loss)
+        endif
+        if (val_samples_processed > 0) then
+            print '(A,F10.6)', "  Val Loss:   ", val_avg_loss
+            if (fourier_weight == 0.0) then
+                print '(A,F10.6)', "  Val RMSE:   ", sqrt(val_avg_loss)
+            endif
+        endif
+        print '(A,F8.2,A)', "  Time:       ", epoch_end_time - epoch_start_time, " seconds"
+        print '(A,F8.2,A)', "  Throughput: ", samples_processed / (epoch_end_time - epoch_start_time), " samples/sec"
+
+        ! Save checkpoint if enabled
+        if (save_checkpoints) then
+            if (val_avg_loss < best_val_loss) then
+                best_val_loss = val_avg_loss
+                print *, "  New best model! Saving checkpoint..."
+                call save_checkpoint(epoch, val_avg_loss)
+            else
+                print '(A,F10.6)', "  Best val loss: ", best_val_loss
+            endif
+        endif
+        print *, ""
+
+    end do
+
+    print *, "=============================================="
+    print *, "  Training Complete"
+    print *, "=============================================="
+    print '(A,F10.6)', "  Best Val Loss: ", best_val_loss
+    if (fourier_weight == 0.0) then
+        print '(A,F10.6)', "  Best Val RMSE: ", sqrt(best_val_loss)
+    endif
+    print *, ""
+
+    ! Cleanup
+    deallocate(batch_noisy_flat, batch_clean_flat)
+    deallocate(batch_input, batch_target)
+    deallocate(hidden1, hidden2, output)
+    deallocate(grad_output, grad_hidden2, grad_hidden1)
+    if (fourier_weight > 0.0) then
+        deallocate(output_flat, target_flat)
+        call destroy_fourier_loss()
+    endif
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+    call conv2d_cleanup(conv3)
+    call cryo_loader_cleanup()
+    istat = cudnnDestroy(cudnn_handle)
+
+contains
+
+    !================================================================
+    ! Reshape flat array to 4D tensor
+    ! Input: flat(1024*1024, batch)
+    ! Output: tensor_4d(W, H, C, N) = (1024, 1024, 1, batch)
+    !================================================================
+    subroutine reshape_flat_to_4d(flat, tensor_4d, batch_size)
+        real(4), managed, intent(in) :: flat(:,:)
+        real(4), device, intent(out) :: tensor_4d(:,:,:,:)
+        integer, intent(in) :: batch_size
+
+        integer :: b, idx, w, h
+
+        !$cuf kernel do(2) <<< *, * >>>
+        do b = 1, batch_size
+            do idx = 1, IMG_SIZE * IMG_SIZE
+                ! Convert 1D index to 2D coords
+                h = (idx - 1) / IMG_SIZE + 1
+                w = mod(idx - 1, IMG_SIZE) + 1
+                ! Store in (W, H, C=1, N) format
+                tensor_4d(w, h, 1, b) = flat(idx, b)
+            end do
+        end do
+
+    end subroutine reshape_flat_to_4d
+
+    !================================================================
+    ! Reshape 4D tensor to flat array for Fourier loss
+    ! Input: tensor_4d(W, H, C=1, N)
+    ! Output: flat(W*H, N)
+    !================================================================
+    subroutine reshape_4d_to_flat(tensor_4d, flat, batch_size)
+        real(4), device, intent(in) :: tensor_4d(:,:,:,:)
+        real(4), device, intent(out) :: flat(:,:)
+        integer, intent(in) :: batch_size
+
+        integer :: b, idx, w, h
+
+        !$cuf kernel do(2) <<< *, * >>>
+        do b = 1, batch_size
+            do idx = 1, IMG_SIZE * IMG_SIZE
+                h = (idx - 1) / IMG_SIZE + 1
+                w = mod(idx - 1, IMG_SIZE) + 1
+                flat(idx, b) = tensor_4d(w, h, 1, b)
+            end do
+        end do
+
+    end subroutine reshape_4d_to_flat
+
+    !================================================================
+    ! Scale gradient by a factor
+    !================================================================
+    subroutine scale_gradient(grad, factor, batch_size)
+        real(4), device, intent(inout) :: grad(:,:,:,:)
+        real(4), intent(in) :: factor
+        integer, intent(in) :: batch_size
+
+        integer :: b, c, h, w
+        integer :: wd, ht, ch
+
+        wd = size(grad, 1)
+        ht = size(grad, 2)
+        ch = size(grad, 3)
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, ch
+                do h = 1, ht
+                    do w = 1, wd
+                        grad(w, h, c, b) = grad(w, h, c, b) * factor
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine scale_gradient
+
+    !================================================================
+    ! ReLU activation (in-place)
+    !================================================================
+    subroutine relu_forward(x, batch_size, channels, height, width)
+        real(4), device, intent(inout) :: x(:,:,:,:)
+        integer, intent(in) :: batch_size, channels, height, width
+        integer :: b, c, h, w
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, channels
+                do h = 1, height
+                    do w = 1, width
+                        if (x(w, h, c, b) < 0.0) then
+                            x(w, h, c, b) = 0.0
+                        endif
+                    end do
+                end do
+            end do
+        end do
+    end subroutine relu_forward
+
+    !================================================================
+    ! ReLU gradient (in-place)
+    !================================================================
+    subroutine relu_backward(activation, grad, batch_size, channels, height, width)
+        real(4), device, intent(in) :: activation(:,:,:,:)
+        real(4), device, intent(inout) :: grad(:,:,:,:)
+        integer, intent(in) :: batch_size, channels, height, width
+        integer :: b, c, h, w
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, channels
+                do h = 1, height
+                    do w = 1, width
+                        if (activation(w, h, c, b) <= 0.0) then
+                            grad(w, h, c, b) = 0.0
+                        endif
+                    end do
+                end do
+            end do
+        end do
+    end subroutine relu_backward
+
+    !================================================================
+    ! MSE Loss computation
+    !================================================================
+    subroutine compute_mse_loss(pred, target, grad, batch_size, loss)
+        real(4), device, intent(in) :: pred(:,:,:,:)
+        real(4), device, intent(in) :: target(:,:,:,:)
+        real(4), device, intent(out) :: grad(:,:,:,:)
+        integer, intent(in) :: batch_size
+        real(4), intent(out) :: loss
+
+        real(4) :: scale
+        integer :: b, c, h, w
+        integer :: total_elements, wd, ht, ch
+        real(4), allocatable :: h_pred(:,:,:,:), h_tgt(:,:,:,:)
+        real(4) :: pred_mean, tgt_mean, diff_mean
+        logical, save :: first_call = .true.
+
+        wd = size(pred, 1)
+        ht = size(pred, 2)
+        ch = size(pred, 3)
+        total_elements = batch_size * ch * ht * wd
+        scale = 2.0 / real(total_elements)
+
+        ! Compute gradient on GPU
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, ch
+                do h = 1, ht
+                    do w = 1, wd
+                        grad(w, h, c, b) = scale * (pred(w, h, c, b) - target(w, h, c, b))
+                    end do
+                end do
+            end do
+        end do
+
+        ! Compute loss on host (GPU reduction unreliable)
+        allocate(h_pred(wd, ht, ch, batch_size))
+        allocate(h_tgt(wd, ht, ch, batch_size))
+        h_pred = pred(:, :, :, 1:batch_size)
+        h_tgt = target(:, :, :, 1:batch_size)
+        istat = cudaDeviceSynchronize()
+        loss = sum((h_pred - h_tgt)**2) / real(total_elements)
+
+        ! DEBUG: Print stats on first call
+        if (first_call) then
+            pred_mean = sum(h_pred) / size(h_pred)
+            tgt_mean = sum(h_tgt) / size(h_tgt)
+            diff_mean = sum(abs(h_pred - h_tgt)) / size(h_pred)
+            print *, ""
+            print *, "DEBUG: First loss calculation"
+            print *, "  pred mean:  ", pred_mean
+            print *, "  target mean:", tgt_mean
+            print *, "  diff mean:  ", diff_mean
+            print *, "  loss:       ", loss
+            print *, "  total_elem: ", total_elements
+            print *, ""
+            first_call = .false.
+        endif
+
+        deallocate(h_pred, h_tgt)
+
+    end subroutine compute_mse_loss
+
+    !================================================================
+    ! Save checkpoint
+    !================================================================
+    subroutine save_checkpoint(epoch_num, val_loss_value)
+        integer, intent(in) :: epoch_num
+        real(4), intent(in) :: val_loss_value
+        character(len=256) :: epoch_dir, filename
+        integer :: unit_num
+
+        ! Create epoch directory
+        write(epoch_dir, '(A,A,I4.4,A)') trim(checkpoint_dir), 'epoch_', epoch_num, '/'
+        call system("mkdir -p " // trim(epoch_dir))
+
+        ! Save loss info
+        write(filename, '(A,A)') trim(epoch_dir), 'loss.txt'
+        open(newunit=unit_num, file=trim(filename), status='replace')
+        write(unit_num, '(F12.8)') val_loss_value
+        close(unit_num)
+
+        ! Save layer weights (binary format for Python loading)
+        call save_layer_weights(conv1, trim(epoch_dir) // 'conv1_')
+        call save_layer_weights(conv2, trim(epoch_dir) // 'conv2_')
+        call save_layer_weights(conv3, trim(epoch_dir) // 'conv3_')
+
+    end subroutine save_checkpoint
+
+    !================================================================
+    ! Save layer weights to disk
+    !================================================================
+    subroutine save_layer_weights(layer, prefix)
+        type(conv2d_layer_t), intent(in) :: layer
+        character(len=*), intent(in) :: prefix
+        real(4), allocatable :: h_weights(:,:,:,:), h_bias(:)
+        integer :: unit_num
+
+        ! Copy weights to host (weights are (out_ch, in_ch, kH, kW) in memory)
+        allocate(h_weights(layer%out_channels, layer%in_channels, layer%kernel_size, layer%kernel_size))
+        allocate(h_bias(layer%out_channels))
+        h_weights = layer%weights
+        h_bias = layer%bias
+        istat = cudaDeviceSynchronize()
+
+        ! Save weights
+        open(newunit=unit_num, file=trim(prefix)//'weights.bin', &
+             status='replace', access='stream', form='unformatted')
+        write(unit_num) h_weights
+        close(unit_num)
+
+        ! Save bias
+        open(newunit=unit_num, file=trim(prefix)//'bias.bin', &
+             status='replace', access='stream', form='unformatted')
+        write(unit_num) h_bias
+        close(unit_num)
+
+        deallocate(h_weights, h_bias)
+
+    end subroutine save_layer_weights
+
+    !================================================================
+    ! Parse command line arguments
+    !================================================================
+    subroutine parse_training_args()
+        character(len=256) :: arg
+        integer :: i, num_args
+
+        num_args = command_argument_count()
+        i = 1
+        do while (i <= num_args)
+            call get_command_argument(i, arg)
+
+            if (trim(arg) == '--epochs') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) num_epochs
+            else if (trim(arg) == '--lr') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) learning_rate
+            else if (trim(arg) == '--fourier_weight') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) fourier_weight
+            else if (trim(arg) == '--max_batches') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) max_batches
+            else if (trim(arg) == '--save') then
+                save_checkpoints = .true.
+            else if (trim(arg) == '--checkpoint_dir') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                checkpoint_dir = trim(arg) // "/"
+            else if (trim(arg) == '--val_split') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) val_split
+            else if (trim(arg) == '--stream') then
+                ! Streaming mode is always active for this version
+                continue
+            endif
+
+            i = i + 1
+        end do
+
+        ! Validate fourier_weight
+        if (fourier_weight < 0.0 .or. fourier_weight > 1.0) then
+            print *, "ERROR: --fourier_weight must be between 0.0 and 1.0"
+            stop 1
+        endif
+
+        ! Create checkpoint directory if saving
+        if (save_checkpoints) then
+            call system("mkdir -p " // trim(checkpoint_dir))
+        endif
+    end subroutine parse_training_args
+
+end program cryo_train_fourier

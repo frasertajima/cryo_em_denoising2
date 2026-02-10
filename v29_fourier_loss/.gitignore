@@ -1,0 +1,9 @@
+# Object files
+*.o
+*.mod
+
+# Executables
+cryo_train_fourier
+test_cufft
+test_cufft_minimal
+test_fourier_loss

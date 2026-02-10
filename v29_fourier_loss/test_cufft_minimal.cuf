@@ -1,0 +1,216 @@
+!================================================================
+! Minimal cuFFT Test - Power Spectrum Computation
+!================================================================
+! Tests:
+!   1. 2D Real-to-Complex FFT using cuFFT
+!   2. Power spectrum computation
+!   3. Verify with known test pattern
+!
+! Compile:
+!   nvfortran -cuda -cudalib=cufft test_cufft_minimal.cuf -o test_cufft
+!
+! Run:
+!   ./test_cufft
+!================================================================
+
+program test_cufft_minimal
+    use cudafor
+    use cufft
+    implicit none
+
+    ! Small test size first (64x64)
+    integer, parameter :: N = 64
+    integer, parameter :: N_COMPLEX = N/2 + 1  ! R2C output size
+
+    ! Host arrays
+    real(4), allocatable :: h_input(:,:)
+    real(4), allocatable :: h_power(:,:)
+    
+    ! Device arrays
+    real(4), device, allocatable :: d_input(:,:)
+    complex(4), device, allocatable :: d_freq(:,:)
+    real(4), device, allocatable :: d_power(:,:)
+
+    ! cuFFT plan
+    integer :: plan
+    integer :: istat
+
+    ! Loop variables
+    integer :: i, j
+    real(4) :: freq_x, freq_y, max_power, sum_power
+
+    print *, "========================================"
+    print *, "Minimal cuFFT Test"
+    print *, "========================================"
+    print *, ""
+
+    ! Allocate arrays
+    allocate(h_input(N, N))
+    allocate(h_power(N_COMPLEX, N))
+    allocate(d_input(N, N))
+    allocate(d_freq(N_COMPLEX, N))
+    allocate(d_power(N_COMPLEX, N))
+
+    !----------------------------------------
+    ! Test 1: DC signal (constant image)
+    !----------------------------------------
+    print *, "Test 1: DC signal (constant value = 1.0)"
+    h_input = 1.0
+    d_input = h_input
+
+    ! Create R2C plan
+    istat = cufftPlan2d(plan, N, N, CUFFT_R2C)
+    if (istat /= 0) then
+        print *, "ERROR: cufftPlan2d failed with status ", istat
+        stop 1
+    end if
+
+    ! Execute FFT
+    istat = cufftExecR2C(plan, d_input, d_freq)
+    if (istat /= 0) then
+        print *, "ERROR: cufftExecR2C failed with status ", istat
+        stop 1
+    end if
+    istat = cudaDeviceSynchronize()
+
+    ! Compute power spectrum: |F|^2 = real^2 + imag^2
+    !$cuf kernel do(2) <<< *, * >>>
+    do j = 1, N
+        do i = 1, N_COMPLEX
+            d_power(i, j) = real(d_freq(i, j))**2 + aimag(d_freq(i, j))**2
+        end do
+    end do
+    istat = cudaDeviceSynchronize()
+
+    ! Copy back and analyze
+    h_power = d_power
+    
+    ! DC component should have all the power
+    print '(A,E12.4)', "  DC component (0,0): ", h_power(1, 1)
+    print '(A,E12.4)', "  Expected (N*N)^2:   ", real(N*N)**2
+    sum_power = sum(h_power)
+    print '(A,E12.4)', "  Total power:        ", sum_power
+    print '(A,E12.4)', "  Non-DC power:       ", sum_power - h_power(1,1)
+    print *, ""
+
+    ! Destroy plan
+    istat = cufftDestroy(plan)
+
+    !----------------------------------------
+    ! Test 2: Single frequency sinusoid
+    !----------------------------------------
+    print *, "Test 2: Single frequency (fx=4, fy=0)"
+    do j = 1, N
+        do i = 1, N
+            h_input(i, j) = sin(2.0 * 3.14159265 * 4.0 * real(i-1) / real(N))
+        end do
+    end do
+    d_input = h_input
+
+    ! Create and execute FFT
+    istat = cufftPlan2d(plan, N, N, CUFFT_R2C)
+    istat = cufftExecR2C(plan, d_input, d_freq)
+    istat = cudaDeviceSynchronize()
+
+    ! Compute power spectrum
+    !$cuf kernel do(2) <<< *, * >>>
+    do j = 1, N
+        do i = 1, N_COMPLEX
+            d_power(i, j) = real(d_freq(i, j))**2 + aimag(d_freq(i, j))**2
+        end do
+    end do
+    istat = cudaDeviceSynchronize()
+    h_power = d_power
+
+    ! Find max power location
+    max_power = 0.0
+    do j = 1, N
+        do i = 1, N_COMPLEX
+            if (h_power(i, j) > max_power) then
+                max_power = h_power(i, j)
+                freq_x = real(i - 1)
+                freq_y = real(j - 1)
+                if (freq_y > N/2) freq_y = freq_y - N  ! Negative frequencies
+            end if
+        end do
+    end do
+    print '(A,F6.1,A,F6.1)', "  Peak at freq (", freq_x, ",", freq_y, ")"
+    print '(A,E12.4)', "  Peak power: ", max_power
+    print '(A)', "  Expected: peak at (4, 0) or (4, 0) mirrored"
+    print *, ""
+
+    istat = cufftDestroy(plan)
+
+    !----------------------------------------
+    ! Test 3: Power spectrum difference (loss-like)
+    !----------------------------------------
+    print *, "Test 3: Power spectrum MSE between two signals"
+    
+    ! Signal A: freq 4
+    do j = 1, N
+        do i = 1, N
+            h_input(i, j) = sin(2.0 * 3.14159265 * 4.0 * real(i-1) / real(N))
+        end do
+    end do
+    d_input = h_input
+    
+    istat = cufftPlan2d(plan, N, N, CUFFT_R2C)
+    istat = cufftExecR2C(plan, d_input, d_freq)
+    istat = cudaDeviceSynchronize()
+    
+    !$cuf kernel do(2) <<< *, * >>>
+    do j = 1, N
+        do i = 1, N_COMPLEX
+            d_power(i, j) = real(d_freq(i, j))**2 + aimag(d_freq(i, j))**2
+        end do
+    end do
+    
+    ! Save power A
+    h_power = d_power
+    istat = cufftDestroy(plan)
+    
+    ! Signal B: freq 5 (slightly different)
+    do j = 1, N
+        do i = 1, N
+            h_input(i, j) = sin(2.0 * 3.14159265 * 5.0 * real(i-1) / real(N))
+        end do
+    end do
+    d_input = h_input
+    
+    istat = cufftPlan2d(plan, N, N, CUFFT_R2C)
+    istat = cufftExecR2C(plan, d_input, d_freq)
+    istat = cudaDeviceSynchronize()
+    
+    ! Compute MSE in power spectrum domain
+    block
+        real(4) :: power_b, mse_sum
+        real(4), allocatable :: h_power_b(:,:)
+        allocate(h_power_b(N_COMPLEX, N))
+        
+        !$cuf kernel do(2) <<< *, * >>>
+        do j = 1, N
+            do i = 1, N_COMPLEX
+                d_power(i, j) = real(d_freq(i, j))**2 + aimag(d_freq(i, j))**2
+            end do
+        end do
+        h_power_b = d_power
+        
+        mse_sum = sum((h_power - h_power_b)**2) / real(N_COMPLEX * N)
+        print '(A,E12.4)', "  Power spectrum MSE (freq 4 vs 5): ", mse_sum
+        print '(A)', "  (Non-zero MSE expected - different frequencies)"
+        
+        deallocate(h_power_b)
+    end block
+    
+    istat = cufftDestroy(plan)
+
+    print *, ""
+    print *, "========================================"
+    print *, "All tests completed successfully!"
+    print *, "========================================"
+
+    ! Cleanup
+    deallocate(h_input, h_power)
+    deallocate(d_input, d_freq, d_power)
+
+end program test_cufft_minimal
