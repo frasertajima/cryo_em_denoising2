@@ -97,6 +97,7 @@ program cryo_train_fourier
     real(4) :: batch_loss, mse_loss_val, fourier_loss_val, epoch_loss, avg_loss
     real(4) :: epoch_mse_loss, epoch_fourier_loss
     real(4) :: val_loss, val_avg_loss
+    real(4) :: val_mse_loss, val_fourier_loss, val_avg_mse, val_avg_fourier
     real(4) :: epoch_start_time, epoch_end_time
     integer :: samples_processed, val_samples_processed
     integer :: istat
@@ -296,11 +297,15 @@ program cryo_train_fourier
 
         ! === VALIDATION PHASE ===
         val_loss = 0.0
+        val_mse_loss = 0.0
+        val_fourier_loss = 0.0
         val_samples_processed = 0
 
         if (max_batches > 0) then
             ! Quick test mode - skip validation
             val_avg_loss = avg_loss
+            val_avg_mse = epoch_mse_loss / samples_processed
+            val_avg_fourier = epoch_fourier_loss / samples_processed
             goto 100
         endif
 
@@ -323,14 +328,16 @@ program cryo_train_fourier
 
             call conv2d_forward(conv3, hidden2, output)
 
-            ! Compute MSE loss only for validation
+            ! Compute MSE loss for validation
             call compute_mse_loss(output, batch_target, grad_output, actual_batch_size, mse_loss_val)
+            val_mse_loss = val_mse_loss + mse_loss_val
 
             ! Include Fourier loss in validation if enabled
             if (fourier_weight > 0.0) then
                 call reshape_4d_to_flat(output, output_flat, actual_batch_size)
                 call reshape_4d_to_flat(batch_target, target_flat, actual_batch_size)
                 call compute_fourier_loss(output_flat, target_flat, actual_batch_size, fourier_loss_val)
+                val_fourier_loss = val_fourier_loss + fourier_loss_val
                 batch_loss = (1.0 - fourier_weight) * mse_loss_val + fourier_weight * fourier_loss_val
             else
                 batch_loss = mse_loss_val
@@ -342,8 +349,12 @@ program cryo_train_fourier
 
         if (val_samples_processed > 0) then
             val_avg_loss = val_loss / val_samples_processed
+            val_avg_mse = val_mse_loss / val_samples_processed
+            val_avg_fourier = val_fourier_loss / val_samples_processed
         else
             val_avg_loss = 0.0
+            val_avg_mse = 0.0
+            val_avg_fourier = 0.0
         endif
 
         call cpu_time(epoch_end_time)
@@ -362,7 +373,10 @@ program cryo_train_fourier
         endif
         if (val_samples_processed > 0) then
             print '(A,F10.6)', "  Val Loss:   ", val_avg_loss
-            if (fourier_weight == 0.0) then
+            if (fourier_weight > 0.0) then
+                print '(A,F10.6)', "  Val MSE:    ", val_avg_mse
+                print '(A,F10.6)', "  Val FFT:    ", val_avg_fourier
+            else
                 print '(A,F10.6)', "  Val RMSE:   ", sqrt(val_avg_loss)
             endif
         endif

@@ -62,8 +62,10 @@
   Train MSE:    0.009932
   Train FFT:    1.709924
   Val Loss:     0.144612
-  Time:         465.18 seconds
-  Throughput:     4.99 samples/sec
+  Val MSE:      0.006975
+  Val FFT:      1.383344
+  Time:         470.61 seconds
+  Throughput:     4.93 samples/sec
    New best model! Saving checkpoint...
  
  ==============================================

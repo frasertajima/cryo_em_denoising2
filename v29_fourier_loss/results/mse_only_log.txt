@@ -58,8 +58,8 @@
   Train RMSE:   0.099704
   Val Loss:     0.006972
   Val RMSE:     0.083500
-  Time:         461.54 seconds
-  Throughput:     5.03 samples/sec
+  Time:         457.43 seconds
+  Throughput:     5.07 samples/sec
    New best model! Saving checkpoint...
  
  ==============================================
