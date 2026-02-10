@@ -1,0 +1,75 @@
+ 
+ ==============================================
+   Cryo-EM CNN Training - v29 (Fourier Loss)
+ ==============================================
+  Epochs:               1
+  Learning rate:   0.001000
+  Fourier weight:    0.1000
+  Batch size:           4
+  Image size:        1024
+  Val split:       10.0%
+  Checkpoints:   results/fourier_0.1//
+   cuDNN initialized
+ Fourier loss initialized:
+  Image size:  1024 x  1024
+  Freq size:    513 x  1024
+   Fourier loss initialized
+ 
+ ==========================================
+   Cryo-EM Streaming Loader Initialized
+ ==========================================
+  Noisy file:     ../data/cryo_data_streaming/train_input.bin
+  Clean file:     ../data/cryo_data_streaming/train_target.bin
+  Total patches:         10309
+  Patch size:      1024 ×  1024
+  Pixels/patch:        1048576
+  Batch size:                4
+  Total batches:          2578
+  Buffer memory:     64.00 MB
+  Per-batch data:    32.00 MB
+ ==========================================
+ 
+   Streaming data loader initialized
+   Initializing CNN layers...
+   CNN layers initialized
+ 
+ ==============================================
+   Starting Training
+ ==============================================
+  Total batches/epoch:     2578
+  Train batches:           2321
+  Val batches:              257
+ 
+ 
+ DEBUG: First loss calculation
+   pred mean:    -0.2241354    
+   target mean:   0.6849781    
+   diff mean:     0.9091132    
+   loss:          0.8545207    
+   total_elem:       4194304
+ 
+  Epoch  1 | Batch     1/ 2321 | Loss:   2.005331 | MSE:   0.854521 | FFT:  12.362627
+  Epoch  1 | Batch     2/ 2321 | Loss:   1.944491 | MSE:   0.810423 | FFT:  12.151106
+  Epoch  1 | Batch     3/ 2321 | Loss:   1.878863 | MSE:   0.757991 | FFT:  11.966708
+  Epoch  1 | Batch     4/ 2321 | Loss:   1.817372 | MSE:   0.706043 | FFT:  11.819330
+  Epoch  1 | Batch     5/ 2321 | Loss:   1.764989 | MSE:   0.659580 | FFT:  11.713673
+  Epoch  1 | Batch  1000/ 2321 | Loss:   0.226956 | MSE:   0.013765 | FFT:   2.145681
+  Epoch  1 | Batch  2000/ 2321 | Loss:   0.185635 | MSE:   0.010407 | FFT:   1.762690
+  Processed  2321 training batches
+ 
+  ===== Epoch  1 Complete =====
+  Train Loss:   0.179932
+  Train MSE:    0.009932
+  Train FFT:    1.709924
+  Val Loss:     0.144612
+  Time:         465.18 seconds
+  Throughput:     4.99 samples/sec
+   New best model! Saving checkpoint...
+ 
+ ==============================================
+   Training Complete
+ ==============================================
+  Best Val Loss:   0.144612
+ 
+ Fourier loss cleaned up
+ Cryo-EM streaming loader cleaned up

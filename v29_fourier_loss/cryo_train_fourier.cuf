@@ -138,7 +138,7 @@ program cryo_train_fourier
     ! Initialize streaming data loader
     call cryo_loader_init('../data/cryo_data_streaming/train_input.bin', &
                           '../data/cryo_data_streaming/train_target.bin', &
-                          29952, BATCH_SIZE)  ! Full dataset: 29,952 patches
+                          10309, BATCH_SIZE)  ! Full dataset: 10,309 patches
     print *, "  Streaming data loader initialized"
 
     ! Initialize CNN layers

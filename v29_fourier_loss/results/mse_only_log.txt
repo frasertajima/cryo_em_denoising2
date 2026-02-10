@@ -1,0 +1,71 @@
+ 
+ ==============================================
+   Cryo-EM CNN Training - v29 (Fourier Loss)
+ ==============================================
+  Epochs:               1
+  Learning rate:   0.001000
+  Fourier weight:    0.0000
+  Batch size:           4
+  Image size:        1024
+  Val split:       10.0%
+  Checkpoints:   results/mse_only//
+   cuDNN initialized
+ 
+ ==========================================
+   Cryo-EM Streaming Loader Initialized
+ ==========================================
+  Noisy file:     ../data/cryo_data_streaming/train_input.bin
+  Clean file:     ../data/cryo_data_streaming/train_target.bin
+  Total patches:         10309
+  Patch size:      1024 ×  1024
+  Pixels/patch:        1048576
+  Batch size:                4
+  Total batches:          2578
+  Buffer memory:     64.00 MB
+  Per-batch data:    32.00 MB
+ ==========================================
+ 
+   Streaming data loader initialized
+   Initializing CNN layers...
+   CNN layers initialized
+ 
+ ==============================================
+   Starting Training
+ ==============================================
+  Total batches/epoch:     2578
+  Train batches:           2321
+  Val batches:              257
+ 
+ 
+ DEBUG: First loss calculation
+   pred mean:    -0.2241354    
+   target mean:   0.6849781    
+   diff mean:     0.9091132    
+   loss:          0.8545207    
+   total_elem:       4194304
+ 
+  Epoch  1 | Batch     1/ 2321 | Loss:   0.854521 | RMSE:   0.9244
+  Epoch  1 | Batch     2/ 2321 | Loss:   0.810423 | RMSE:   0.9002
+  Epoch  1 | Batch     3/ 2321 | Loss:   0.757991 | RMSE:   0.8706
+  Epoch  1 | Batch     4/ 2321 | Loss:   0.706043 | RMSE:   0.8403
+  Epoch  1 | Batch     5/ 2321 | Loss:   0.659580 | RMSE:   0.8121
+  Epoch  1 | Batch  1000/ 2321 | Loss:   0.013755 | RMSE:   0.1173
+  Epoch  1 | Batch  2000/ 2321 | Loss:   0.010417 | RMSE:   0.1021
+  Processed  2321 training batches
+ 
+  ===== Epoch  1 Complete =====
+  Train Loss:   0.009941
+  Train RMSE:   0.099704
+  Val Loss:     0.006972
+  Val RMSE:     0.083500
+  Time:         461.54 seconds
+  Throughput:     5.03 samples/sec
+   New best model! Saving checkpoint...
+ 
+ ==============================================
+   Training Complete
+ ==============================================
+  Best Val Loss:   0.006972
+  Best Val RMSE:   0.083500
+ 
+ Cryo-EM streaming loader cleaned up
