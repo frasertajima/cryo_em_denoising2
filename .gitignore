@@ -1,0 +1,38 @@
+# Large datasets - DO NOT COMMIT
+data/cryo_data_streaming/
+data/empiar_*/
+*.bin
+*.mrc
+
+# Compiled binaries and object files
+*.o
+*.mod
+*.exe
+cryo_train
+test_*
+!test_*.py
+!test_*.cuf
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Saved models (large checkpoint files)
+saved_models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large images
+*.png
+
+# Logs
+*.log

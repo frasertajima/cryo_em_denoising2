@@ -1,0 +1,320 @@
+!================================================================
+! Convergence Test: One Optimization Step Comparison
+!================================================================
+! Load initial weights, run forward+backward, apply one gradient
+! descent step, and compare updated weights with PyTorch expected.
+!================================================================
+program test_convergence
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    ! cuDNN C interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    ! Test parameters
+    integer, parameter :: IMAGE_SIZE = 128
+    integer, parameter :: BATCH_SIZE = 2
+    real(4), parameter :: LEARNING_RATE = 0.001
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+    integer :: stat
+
+    ! Layers
+    type(conv2d_layer_t) :: conv1, conv2
+
+    ! Device arrays
+    real(4), device, allocatable :: input(:,:,:,:)
+    real(4), device, allocatable :: target(:,:,:,:)
+    real(4), device, allocatable :: conv1_out(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+    real(4), device, allocatable :: grad_conv1(:,:,:,:)
+    real(4), device, allocatable :: grad_input(:,:,:,:)
+
+    ! Host arrays
+    real(4), allocatable :: host_input(:,:,:,:)
+    real(4), allocatable :: host_target(:,:,:,:)
+    real(4), allocatable :: host_output(:,:,:,:)
+    real(4), allocatable :: pytorch_expected(:,:,:,:)
+    real(4), allocatable :: pytorch_expected_1d(:)
+    real(4), allocatable :: fortran_updated(:,:,:,:)
+    real(4), allocatable :: fortran_updated_1d(:)
+
+    ! Metrics
+    real(4) :: loss, max_diff, mean_diff
+    integer :: i
+
+    print *, ""
+    print *, "======================================================================"
+    print *, "  Convergence Test: One Optimization Step"
+    print *, "======================================================================"
+    print *, ""
+
+    ! Initialize cuDNN
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) stop "cuDNN init failed"
+
+    ! Initialize layers
+    call conv2d_init(conv1, cudnn_handle, 1, 16, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.true.)
+    call conv2d_init(conv2, cudnn_handle, 16, 1, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    print *, "✓ Layers initialized"
+    print *, ""
+
+    ! Allocate arrays
+    allocate(input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv1_out(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_conv1(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(host_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    ! Load data
+    call load_binary('convergence_test/input.bin', host_input)
+    call load_binary('convergence_test/target.bin', host_target)
+
+    ! Load initial weights
+    call load_weights(conv1, 'convergence_test/0_weight_initial.bin', 'convergence_test/0_bias_initial.bin')
+    call load_weights(conv2, 'convergence_test/2_weight_initial.bin', 'convergence_test/2_bias_initial.bin')
+
+    print *, "✓ Data and weights loaded"
+    print *, ""
+
+    ! Copy to device
+    input = host_input
+    target = host_target
+
+    ! Forward pass
+    call conv2d_forward(conv1, input, conv1_out)
+    call conv2d_forward(conv2, conv1_out, output)
+
+    ! Compute loss
+    host_output = output
+    loss = sum((host_output - host_target)**2) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+    print *, "Forward loss:", loss
+    print *, ""
+
+    ! Backward pass - compute gradient on host to avoid device self-reference
+    host_output = output
+    print *, "grad_output normalization factor:", IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE
+    print *, "grad_output mean before:", sum(2.0 * (host_output - host_target))/(IMAGE_SIZE*IMAGE_SIZE*BATCH_SIZE)
+    host_output = 2.0 * (host_output - host_target) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+    print *, "grad_output mean after:", sum(host_output)/(IMAGE_SIZE*IMAGE_SIZE*BATCH_SIZE)
+    grad_output = host_output
+
+    call conv2d_backward(conv2, conv1_out, output, grad_output, grad_conv1, compute_grad_input=.true.)
+    call conv2d_backward(conv1, input, conv1_out, grad_conv1, grad_input, compute_grad_input=.false.)
+
+    print *, "✓ Backward pass complete"
+    print *, ""
+
+    ! Print gradient magnitudes for debugging
+    block
+        real(4), allocatable :: temp_g(:,:,:,:)
+        allocate(temp_g(size(conv1%grad_weights,1), size(conv1%grad_weights,2), size(conv1%grad_weights,3), size(conv1%grad_weights,4)))
+        temp_g = conv1%grad_weights
+        print *, "Conv1 grad_weights: max=", maxval(abs(temp_g)), " mean=", sum(abs(temp_g))/size(temp_g)
+        deallocate(temp_g)
+
+        allocate(temp_g(size(conv2%grad_weights,1), size(conv2%grad_weights,2), size(conv2%grad_weights,3), size(conv2%grad_weights,4)))
+        temp_g = conv2%grad_weights
+        print *, "Conv2 grad_weights: max=", maxval(abs(temp_g)), " mean=", sum(abs(temp_g))/size(temp_g)
+        deallocate(temp_g)
+    end block
+    print *, ""
+
+    ! Apply gradient descent: w = w - lr * grad
+    print *, "Applying gradient descent (lr =", LEARNING_RATE, ")"
+    print *, ""
+
+    block
+        real(4), allocatable :: temp_w(:,:,:,:), temp_g(:,:,:,:), temp_b(:), temp_gb(:)
+
+        ! Update conv1
+        allocate(temp_w(size(conv1%weights,1), size(conv1%weights,2), size(conv1%weights,3), size(conv1%weights,4)))
+        allocate(temp_g(size(conv1%grad_weights,1), size(conv1%grad_weights,2), size(conv1%grad_weights,3), size(conv1%grad_weights,4)))
+        allocate(temp_b(size(conv1%bias,1)))
+        allocate(temp_gb(size(conv1%grad_bias,1)))
+
+        temp_w = conv1%weights
+        temp_g = conv1%grad_weights
+        temp_b = conv1%bias
+        temp_gb = conv1%grad_bias
+
+        temp_w = temp_w - LEARNING_RATE * temp_g
+        temp_b = temp_b - LEARNING_RATE * temp_gb
+
+        conv1%weights = temp_w
+        conv1%bias = temp_b
+
+        deallocate(temp_w, temp_g, temp_b, temp_gb)
+
+        ! Update conv2
+        allocate(temp_w(size(conv2%weights,1), size(conv2%weights,2), size(conv2%weights,3), size(conv2%weights,4)))
+        allocate(temp_g(size(conv2%grad_weights,1), size(conv2%grad_weights,2), size(conv2%grad_weights,3), size(conv2%grad_weights,4)))
+        allocate(temp_b(size(conv2%bias,1)))
+        allocate(temp_gb(size(conv2%grad_bias,1)))
+
+        temp_w = conv2%weights
+        temp_g = conv2%grad_weights
+        temp_b = conv2%bias
+        temp_gb = conv2%grad_bias
+
+        temp_w = temp_w - LEARNING_RATE * temp_g
+        temp_b = temp_b - LEARNING_RATE * temp_gb
+
+        conv2%weights = temp_w
+        conv2%bias = temp_b
+
+        deallocate(temp_w, temp_g, temp_b, temp_gb)
+    end block
+
+    ! Compare updated weights with PyTorch expected
+    print *, "======================================================================"
+    print *, "Comparing Updated Weights with PyTorch"
+    print *, "======================================================================"
+    print *, ""
+
+    ! Conv1 weights
+    allocate(pytorch_expected(3, 3, 1, 16))
+    allocate(fortran_updated(3, 3, 1, 16))
+    call load_binary('convergence_test/0_weight_expected.bin', pytorch_expected)
+    call transform_weights_for_comparison(conv1%weights, fortran_updated, 16, 1, 3)
+    call compare_4d("Conv1 weights", fortran_updated, pytorch_expected, max_diff, mean_diff)
+    deallocate(pytorch_expected, fortran_updated)
+
+    ! Conv1 bias
+    allocate(pytorch_expected_1d(16))
+    allocate(fortran_updated_1d(16))
+    call load_binary('convergence_test/0_bias_expected.bin', pytorch_expected_1d)
+    fortran_updated_1d = conv1%bias
+    call compare_1d("Conv1 bias", fortran_updated_1d, pytorch_expected_1d, max_diff, mean_diff)
+    deallocate(pytorch_expected_1d, fortran_updated_1d)
+
+    ! Conv2 weights
+    allocate(pytorch_expected(3, 3, 16, 1))
+    allocate(fortran_updated(3, 3, 16, 1))
+    call load_binary('convergence_test/2_weight_expected.bin', pytorch_expected)
+    call transform_weights_for_comparison(conv2%weights, fortran_updated, 1, 16, 3)
+    call compare_4d("Conv2 weights", fortran_updated, pytorch_expected, max_diff, mean_diff)
+    deallocate(pytorch_expected, fortran_updated)
+
+    ! Conv2 bias
+    allocate(pytorch_expected_1d(1))
+    allocate(fortran_updated_1d(1))
+    call load_binary('convergence_test/2_bias_expected.bin', pytorch_expected_1d)
+    fortran_updated_1d = conv2%bias
+    call compare_1d("Conv2 bias", fortran_updated_1d, pytorch_expected_1d, max_diff, mean_diff)
+    deallocate(pytorch_expected_1d, fortran_updated_1d)
+
+    print *, ""
+    print *, "======================================================================"
+    print *, "Convergence test complete"
+    print *, "======================================================================"
+
+contains
+
+    subroutine load_binary(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(..)
+
+        open(unit=100, file=trim(filename), form='unformatted', access='stream', status='old')
+        read(100) array
+        close(100)
+    end subroutine
+
+    subroutine load_weights(layer, weight_file, bias_file)
+        type(conv2d_layer_t), intent(inout) :: layer
+        character(len=*), intent(in) :: weight_file, bias_file
+        real(4), allocatable :: temp_weight(:,:,:,:)
+        real(4), allocatable :: temp_bias(:)
+        integer :: out_c, in_c, k, i, j, l, m
+
+        ! Get dimensions from layer
+        out_c = size(layer%weights, 1)
+        in_c = size(layer%weights, 2)
+        k = size(layer%weights, 3)
+
+        allocate(temp_weight(k, k, in_c, out_c))
+        allocate(temp_bias(out_c))
+
+        call load_binary(weight_file, temp_weight)
+        call load_binary(bias_file, temp_bias)
+
+        ! Transform: (H,W,In,Out) -> (Out,In,H,W) with spatial flip
+        do l = 1, out_c
+            do i = 1, in_c
+                do j = 1, k
+                    do m = 1, k
+                        layer%weights(l, i, j, m) = temp_weight(k-j+1, k-m+1, i, l)
+                    end do
+                end do
+            end do
+        end do
+
+        layer%bias = temp_bias
+
+        deallocate(temp_weight, temp_bias)
+    end subroutine
+
+    subroutine transform_weights_for_comparison(fortran_w, transformed, out_c, in_c, k)
+        real(4), device, intent(in) :: fortran_w(:,:,:,:)
+        real(4), intent(out) :: transformed(:,:,:,:)
+        integer, intent(in) :: out_c, in_c, k
+        real(4), allocatable :: temp(:,:,:,:)
+        integer :: i, j, l, m
+
+        allocate(temp(out_c, in_c, k, k))
+        temp = fortran_w
+
+        ! Transform: (Out,In,H,W) -> (H,W,In,Out) with spatial flip
+        do l = 1, out_c
+            do m = 1, in_c
+                do j = 1, k
+                    do i = 1, k
+                        transformed(i, j, m, l) = temp(l, m, k-i+1, k-j+1)
+                    end do
+                end do
+            end do
+        end do
+
+        deallocate(temp)
+    end subroutine
+
+    subroutine compare_4d(name, fortran, pytorch, max_diff, mean_diff)
+        character(len=*), intent(in) :: name
+        real(4), intent(in) :: fortran(:,:,:,:), pytorch(:,:,:,:)
+        real(4), intent(out) :: max_diff, mean_diff
+
+        max_diff = maxval(abs(fortran - pytorch))
+        mean_diff = sum(abs(fortran - pytorch)) / size(fortran)
+
+        print '(A,A,A,ES12.3,A,ES12.3)', "  ", trim(name), ": max=", max_diff, ", mean=", mean_diff
+    end subroutine
+
+    subroutine compare_1d(name, fortran, pytorch, max_diff, mean_diff)
+        character(len=*), intent(in) :: name
+        real(4), intent(in) :: fortran(:), pytorch(:)
+        real(4), intent(out) :: max_diff, mean_diff
+
+        max_diff = maxval(abs(fortran - pytorch))
+        mean_diff = sum(abs(fortran - pytorch)) / size(fortran)
+
+        print '(A,A,A,ES12.3,A,ES12.3)', "  ", trim(name), ": max=", max_diff, ", mean=", mean_diff
+    end subroutine
+
+end program test_convergence

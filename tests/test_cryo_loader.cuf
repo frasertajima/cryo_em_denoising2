@@ -1,0 +1,135 @@
+!================================================================
+! Test Program for Cryo-EM Streaming Data Loader
+!================================================================
+! Tests the streaming loader with actual Cryo-EM data files
+!
+! Usage:
+!   ./test_cryo_loader
+!
+! Expected output:
+!   - Loader initialization
+!   - First batch statistics
+!   - Memory usage verification
+!================================================================
+program test_cryo_loader
+    use cudafor
+    use streaming_cryo_loader
+    implicit none
+
+    ! Test parameters
+    character(len=512) :: input_file, target_file
+    integer, parameter :: NUM_PATCHES = 29913  ! From preprocessing output
+    integer, parameter :: BATCH_SIZE = 4       ! Small batch for testing
+    integer, parameter :: PIXELS_PER_PATCH = 1024 * 1024
+
+    ! Batch arrays
+    real(4), managed, allocatable :: batch_noisy(:,:)
+    real(4), managed, allocatable :: batch_clean(:,:)
+    integer :: actual_size, batch_idx
+    integer :: istat
+
+    ! Statistics
+    real(4) :: noisy_min, noisy_max, noisy_mean
+    real(4) :: clean_min, clean_max, clean_mean
+    real(4) :: diff_mean, diff_max
+
+    print *, "========================================"
+    print *, "  Cryo-EM Data Loader Test"
+    print *, "========================================"
+    print *, ""
+
+    ! Set file paths
+    input_file = "data/cryo_data_streaming/train_input.bin"
+    target_file = "data/cryo_data_streaming/train_target.bin"
+
+    ! Allocate batch buffers
+    allocate(batch_noisy(PIXELS_PER_PATCH, BATCH_SIZE), stat=istat)
+    allocate(batch_clean(PIXELS_PER_PATCH, BATCH_SIZE), stat=istat)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to allocate batch arrays"
+        stop 1
+    endif
+
+    print *, "Batch array allocated:"
+    print '(A, F8.2, A)', "  Size: ", real(2 * PIXELS_PER_PATCH * BATCH_SIZE * 4) / (1024.0**2), " MB"
+    print *, ""
+
+    ! Initialize loader
+    call cryo_loader_init(input_file, target_file, NUM_PATCHES, BATCH_SIZE)
+
+    if (.not. cryo_loader_is_ready()) then
+        print *, "ERROR: Loader initialization failed"
+        stop 1
+    endif
+
+    ! Start epoch
+    print *, "Starting epoch..."
+    call cryo_loader_start_epoch()
+    print *, ""
+
+    ! Load first batch
+    print *, "Loading first batch..."
+    call cryo_loader_get_batch(batch_noisy, batch_clean, actual_size)
+
+    print '(A, I4, A, I4)', "  Requested: ", BATCH_SIZE, ", Actual: ", actual_size
+    print *, ""
+
+    ! Compute statistics on first patch
+    noisy_min = minval(batch_noisy(:, 1))
+    noisy_max = maxval(batch_noisy(:, 1))
+    noisy_mean = sum(batch_noisy(:, 1)) / real(PIXELS_PER_PATCH)
+
+    clean_min = minval(batch_clean(:, 1))
+    clean_max = maxval(batch_clean(:, 1))
+    clean_mean = sum(batch_clean(:, 1)) / real(PIXELS_PER_PATCH)
+
+    diff_mean = sum(abs(batch_noisy(:, 1) - batch_clean(:, 1))) / real(PIXELS_PER_PATCH)
+    diff_max = maxval(abs(batch_noisy(:, 1) - batch_clean(:, 1)))
+
+    print *, "First patch statistics:"
+    print *, "----------------------------------------"
+    print *, "Noisy patch:"
+    print '(A, F8.4)', "  Min:  ", noisy_min
+    print '(A, F8.4)', "  Max:  ", noisy_max
+    print '(A, F8.4)', "  Mean: ", noisy_mean
+    print *, ""
+    print *, "Clean patch:"
+    print '(A, F8.4)', "  Min:  ", clean_min
+    print '(A, F8.4)', "  Max:  ", clean_max
+    print '(A, F8.4)', "  Mean: ", clean_mean
+    print *, ""
+    print *, "Difference (abs):"
+    print '(A, F8.4)', "  Mean: ", diff_mean
+    print '(A, F8.4)', "  Max:  ", diff_max
+    print *, "----------------------------------------"
+    print *, ""
+
+    ! Verify data is reasonable
+    if (noisy_min < 0.0 .or. noisy_max > 1.0) then
+        print *, "WARNING: Noisy data out of [0, 1] range"
+    endif
+    if (clean_min < 0.0 .or. clean_max > 1.0) then
+        print *, "WARNING: Clean data out of [0, 1] range"
+    endif
+    if (diff_mean < 0.001) then
+        print *, "WARNING: Difference too small - noisy and clean might be identical"
+    endif
+
+    ! Load a few more batches to test streaming
+    print *, "Testing batch streaming..."
+    do batch_idx = 2, min(5, cryo_loader_get_num_batches())
+        call cryo_loader_get_batch(batch_noisy, batch_clean, actual_size)
+        print '(A, I4, A, I4)', "  Batch ", batch_idx, ": loaded ", actual_size, " patches"
+    end do
+    print *, ""
+
+    ! Cleanup
+    call cryo_loader_cleanup()
+    deallocate(batch_noisy, batch_clean)
+
+    print *, "========================================"
+    print *, "  Test PASSED"
+    print *, "========================================"
+    print *, ""
+
+end program test_cryo_loader

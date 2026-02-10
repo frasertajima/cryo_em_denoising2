@@ -1,0 +1,255 @@
+!================================================================
+! Cryo-EM Denoising Training - v28f_d
+!================================================================
+! Simple 3-layer CNN for cryo-EM denoising with bug-fixed cuDNN
+!
+! Architecture:
+!   Conv1: 1->16 channels, 3x3, ReLU
+!   Conv2: 16->16 channels, 3x3, ReLU
+!   Conv3: 16->1 channels, 3x3, no ReLU
+!
+! Usage:
+!   ./cryo_train --epochs 5 --batch 4 --lr 0.001
+!
+! Expected: With bug fix, should converge like PyTorch (loss 0.44->0.07)
+!================================================================
+program cryo_train
+    use cudafor
+    use iso_c_binding
+    use streaming_cryo_loader
+    use conv2d_cudnn
+    implicit none
+
+    !================================================================
+    ! Configuration
+    !================================================================
+    integer, parameter :: IMG_SIZE = 1024
+    integer, parameter :: PIXELS = IMG_SIZE * IMG_SIZE
+
+    ! Default training parameters
+    integer :: num_epochs = 5
+    integer :: batch_size = 4
+    real(4) :: learning_rate = 0.001
+
+    ! Dataset
+    character(len=512) :: data_dir = "../data/cryo_data_streaming"
+    integer :: num_train = 29913
+    integer :: num_test = 3102
+
+    !================================================================
+    ! Network layers
+    !================================================================
+    type(conv2d_layer_t) :: conv1, conv2, conv3
+
+    ! Activations (W, H, C, N) layout
+    real(4), device, allocatable :: input(:,:,:,:)
+    real(4), device, allocatable :: conv1_out(:,:,:,:)
+    real(4), device, allocatable :: conv2_out(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+    real(4), device, allocatable :: target(:,:,:,:)
+
+    ! Gradients
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+    real(4), device, allocatable :: grad_conv2(:,:,:,:)
+    real(4), device, allocatable :: grad_conv1(:,:,:,:)
+
+    ! Batch data
+    real(4), allocatable :: batch_noisy(:), batch_clean(:)
+
+    ! Training state
+    integer :: epoch, batch_idx, total_batches
+    real(4) :: batch_loss, epoch_loss
+    integer :: stat
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Cryo-EM Denoising Training - v28f_d"
+    print *, "=============================================="
+    print *, "  Epochs:     ", num_epochs
+    print *, "  Batch size: ", batch_size
+    print *, "  Learn rate: ", learning_rate
+    print *, "  Patches:    ", num_train
+    print *, "=============================================="
+    print *, ""
+
+    !================================================================
+    ! Initialize streaming loader
+    !================================================================
+    call cryo_streaming_init( &
+        trim(data_dir) // "/train_input.bin", &
+        trim(data_dir) // "/train_target.bin", &
+        num_train, PIXELS, batch_size, &
+        CRYO_SHUFFLE_EPOCH, 42)
+
+    !================================================================
+    ! Initialize network
+    !================================================================
+    ! Conv1: 1->16, 3x3, padding=1, ReLU
+    call conv2d_init(conv1, IMG_SIZE, IMG_SIZE, 1, 16, 3, 1, batch_size, &
+                     use_relu=.true., use_adam=.true., learning_rate=learning_rate)
+
+    ! Conv2: 16->16, 3x3, padding=1, ReLU
+    call conv2d_init(conv2, IMG_SIZE, IMG_SIZE, 16, 16, 3, 1, batch_size, &
+                     use_relu=.true., use_adam=.true., learning_rate=learning_rate)
+
+    ! Conv3: 16->1, 3x3, padding=1, no ReLU (regression)
+    call conv2d_init(conv3, IMG_SIZE, IMG_SIZE, 16, 1, 3, 1, batch_size, &
+                     use_relu=.false., use_adam=.true., learning_rate=learning_rate)
+
+    !================================================================
+    ! Allocate activations
+    !================================================================
+    allocate(input(IMG_SIZE, IMG_SIZE, 1, batch_size))
+    allocate(conv1_out(IMG_SIZE, IMG_SIZE, 16, batch_size))
+    allocate(conv2_out(IMG_SIZE, IMG_SIZE, 16, batch_size))
+    allocate(output(IMG_SIZE, IMG_SIZE, 1, batch_size))
+    allocate(target(IMG_SIZE, IMG_SIZE, 1, batch_size))
+
+    allocate(grad_output(IMG_SIZE, IMG_SIZE, 1, batch_size))
+    allocate(grad_conv2(IMG_SIZE, IMG_SIZE, 16, batch_size))
+    allocate(grad_conv1(IMG_SIZE, IMG_SIZE, 16, batch_size))
+
+    allocate(batch_noisy(PIXELS * batch_size))
+    allocate(batch_clean(PIXELS * batch_size))
+
+    print *, "Network initialized"
+    print *, "  Parameters: ", conv1%num_params + conv2%num_params + conv3%num_params
+    print *, ""
+
+    !================================================================
+    ! Training loop
+    !================================================================
+    total_batches = num_train / batch_size
+
+    do epoch = 1, num_epochs
+        call cryo_streaming_start_epoch()
+        epoch_loss = 0.0
+
+        do batch_idx = 1, total_batches
+            ! Load batch
+            call cryo_streaming_get_batch(batch_noisy, batch_clean, stat)
+            if (stat /= 0) exit
+
+            ! Reshape to 4D: (W, H, C, N)
+            call reshape_to_4d(batch_noisy, input, IMG_SIZE, IMG_SIZE, 1, batch_size)
+            call reshape_to_4d(batch_clean, target, IMG_SIZE, IMG_SIZE, 1, batch_size)
+
+            ! Forward pass
+            call conv2d_forward(conv1, input, conv1_out)
+            call conv2d_forward(conv2, conv1_out, conv2_out)
+            call conv2d_forward(conv3, conv2_out, output)
+
+            ! Compute loss (MSE)
+            call compute_mse_loss(output, target, batch_size, PIXELS, batch_loss)
+            epoch_loss = epoch_loss + batch_loss
+
+            ! Backward pass
+            call compute_mse_gradient(output, target, batch_size, PIXELS, grad_output)
+            call conv2d_backward(conv3, conv2_out, grad_output, grad_conv2)
+            call conv2d_backward(conv2, conv1_out, grad_conv2, grad_conv1)
+            call conv2d_backward(conv1, input, grad_conv1)
+
+            ! Update weights (Adam inside conv2d_backward)
+
+            ! Print progress
+            if (mod(batch_idx, 1000) == 0 .or. batch_idx == total_batches) then
+                print '(A,I4,A,I5,A,I5,A,F10.6)', &
+                    "  Epoch ", epoch, " | Batch ", batch_idx, "/", total_batches, &
+                    " | Loss: ", batch_loss
+            endif
+        enddo
+
+        epoch_loss = epoch_loss / total_batches
+        print *, ""
+        print '(A,I4,A)', "  ===== Epoch ", epoch, " Complete ====="
+        print '(A,F10.6)', "  Average Loss: ", epoch_loss
+        print *, ""
+    enddo
+
+    print *, "=============================================="
+    print *, "  Training Complete!"
+    print *, "=============================================="
+    print '(A,F10.6)', "  Final Loss: ", epoch_loss
+    print *, ""
+
+    !================================================================
+    ! Cleanup
+    !================================================================
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+    call conv2d_cleanup(conv3)
+    call cryo_streaming_cleanup()
+
+    deallocate(input, conv1_out, conv2_out, output, target)
+    deallocate(grad_output, grad_conv2, grad_conv1)
+    deallocate(batch_noisy, batch_clean)
+
+contains
+
+    !================================================================
+    ! Helper: Reshape flat array to 4D (W, H, C, N)
+    !================================================================
+    subroutine reshape_to_4d(flat, tensor, w, h, c, n)
+        real(4), intent(in) :: flat(:)
+        real(4), device, intent(out) :: tensor(:,:,:,:)
+        integer, intent(in) :: w, h, c, n
+        integer :: i, j, k, l, idx
+
+        idx = 1
+        do l = 1, n
+            do k = 1, c
+                do j = 1, h
+                    do i = 1, w
+                        tensor(i,j,k,l) = flat(idx)
+                        idx = idx + 1
+                    enddo
+                enddo
+            enddo
+        enddo
+    end subroutine reshape_to_4d
+
+    !================================================================
+    ! Helper: Compute MSE loss
+    !================================================================
+    subroutine compute_mse_loss(pred, target, batch_size, pixels, loss)
+        real(4), device, intent(in) :: pred(:,:,:,:), target(:,:,:,:)
+        integer, intent(in) :: batch_size, pixels
+        real(4), intent(out) :: loss
+        real(4), device, allocatable :: diff(:,:,:,:)
+        real(4) :: sum_sq
+        integer :: i, j, k, l
+
+        allocate(diff(size(pred,1), size(pred,2), size(pred,3), size(pred,4)))
+
+        diff = pred - target
+        diff = diff * diff
+
+        sum_sq = 0.0
+        do l = 1, batch_size
+            do k = 1, size(pred,3)
+                do j = 1, size(pred,2)
+                    do i = 1, size(pred,1)
+                        sum_sq = sum_sq + diff(i,j,k,l)
+                    enddo
+                enddo
+            enddo
+        enddo
+
+        loss = sum_sq / (batch_size * pixels)
+        deallocate(diff)
+    end subroutine compute_mse_loss
+
+    !================================================================
+    ! Helper: Compute MSE gradient
+    !================================================================
+    subroutine compute_mse_gradient(pred, target, batch_size, pixels, grad)
+        real(4), device, intent(in) :: pred(:,:,:,:), target(:,:,:,:)
+        integer, intent(in) :: batch_size, pixels
+        real(4), device, intent(out) :: grad(:,:,:,:)
+        real(4) :: scale
+
+        scale = 2.0 / (batch_size * pixels)
+        grad = scale * (pred - target)
+    end subroutine compute_mse_gradient
+
+end program cryo_train

@@ -1,0 +1,110 @@
+! Minimal test to isolate the loss calculation bug
+program test_loss_bug
+    use cudafor
+    implicit none
+
+    integer, parameter :: W = 4, H = 4, C = 1, N = 2  ! Tiny 4x4 images, 2 in batch
+    real(4), device, allocatable :: pred(:,:,:,:), target(:,:,:,:), grad(:,:,:,:)
+    real(4), allocatable :: h_pred(:,:,:,:), h_tgt(:,:,:,:)
+    real(4) :: loss, expected_loss
+    integer :: i, j, k, l, total_elements
+    integer :: istat
+
+    ! Allocate
+    allocate(pred(W, H, C, N))
+    allocate(target(W, H, C, N))
+    allocate(grad(W, H, C, N))
+
+    ! Set pred = 0.5 everywhere
+    pred = 0.5
+
+    ! Set target = 0.7 everywhere
+    target = 0.7
+
+    ! Expected MSE: (0.5 - 0.7)^2 = 0.04
+    expected_loss = 0.04
+
+    print *, "="*60
+    print *, "Testing Loss Calculation"
+    print *, "="*60
+    print *, "pred:   all 0.5"
+    print *, "target: all 0.7"
+    print *, "Expected MSE: 0.04"
+    print *, ""
+
+    ! Compute loss using THE EXACT SAME CODE as compute_mse_loss
+    total_elements = N * C * H * W
+
+    allocate(h_pred(W, H, C, N))
+    allocate(h_tgt(W, H, C, N))
+
+    ! Copy from device to host (this is where bug might be!)
+    h_pred = pred(:, :, :, 1:N)
+    h_tgt = target(:, :, :, 1:N)
+    istat = cudaDeviceSynchronize()
+
+    ! Compute loss
+    loss = sum((h_pred - h_tgt)**2) / real(total_elements)
+
+    print *, "Computed loss: ", loss
+    print *, "Expected loss: ", expected_loss
+    print *, ""
+
+    if (abs(loss - expected_loss) < 1e-6) then
+        print *, "✓ PASS - Loss calculation is correct!"
+    else
+        print *, "✗ FAIL - Loss calculation is BROKEN!"
+        print *, "  Difference: ", abs(loss - expected_loss)
+    end if
+
+    ! Now test with actual different values
+    print *, ""
+    print *, "="*60
+    print *, "Test 2: pred=0.3, target=0.7"
+    print *, "="*60
+
+    pred = 0.3
+    target = 0.7
+    expected_loss = 0.16  ! (0.3-0.7)^2 = 0.16
+
+    h_pred = pred(:, :, :, 1:N)
+    h_tgt = target(:, :, :, 1:N)
+    istat = cudaDeviceSynchronize()
+    loss = sum((h_pred - h_tgt)**2) / real(total_elements)
+
+    print *, "Computed loss: ", loss
+    print *, "Expected loss: ", expected_loss
+
+    if (abs(loss - expected_loss) < 1e-6) then
+        print *, "✓ PASS"
+    else
+        print *, "✗ FAIL - Difference: ", abs(loss - expected_loss)
+    end if
+
+    ! Test 3: Check if the copy is actually working
+    print *, ""
+    print *, "="*60
+    print *, "Test 3: Verify device→host copy"
+    print *, "="*60
+
+    ! Set specific pattern
+    do l = 1, N
+        do k = 1, C
+            do j = 1, H
+                do i = 1, W
+                    pred(i, j, k, l) = real(i + j*10 + l*100)
+                end do
+            end do
+        end do
+    end do
+
+    h_pred = pred(:, :, :, 1:N)
+    istat = cudaDeviceSynchronize()
+
+    print *, "First few values should be: 11, 12, 13, 14, 21, 22..."
+    print *, "Actual values: ", h_pred(1,1,1,1), h_pred(2,1,1,1), h_pred(3,1,1,1), &
+                                h_pred(4,1,1,1), h_pred(1,2,1,1), h_pred(2,2,1,1)
+
+    deallocate(pred, target, grad, h_pred, h_tgt)
+
+end program test_loss_bug

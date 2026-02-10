@@ -1,0 +1,90 @@
+! Test if the data loader is returning correct data
+program test_loader
+    use streaming_cryo_loader
+    use cudafor
+    implicit none
+
+    integer, parameter :: MY_BATCH_SIZE = 4
+
+    real(4), managed, allocatable :: batch_noisy(:,:), batch_clean(:,:)
+    real(4), allocatable :: h_noisy(:), h_clean(:)
+    integer :: actual_batch_size, i
+    real(4) :: noisy_mean, clean_mean, noisy_std, clean_std
+    real(4) :: diff_mean, diff_max
+
+    ! Allocate
+    allocate(batch_noisy(PATCH_PIXELS, MY_BATCH_SIZE))
+    allocate(batch_clean(PATCH_PIXELS, MY_BATCH_SIZE))
+    allocate(h_noisy(PATCH_PIXELS))
+    allocate(h_clean(PATCH_PIXELS))
+
+    print *, "="*70
+    print *, "Testing Data Loader"
+    print *, "="*70
+
+    ! Initialize loader
+    call cryo_loader_init('../data/cryo_data_streaming/train_input.bin', &
+                          '../data/cryo_data_streaming/train_target.bin', &
+                          29913, MY_BATCH_SIZE)
+
+    call cryo_loader_start_epoch()
+
+    ! Get first batch
+    call cryo_loader_get_batch(batch_noisy, batch_clean, actual_batch_size)
+
+    print *, "Got batch with", actual_batch_size, "patches"
+    print *, ""
+
+    ! Check first patch
+    h_noisy = batch_noisy(:, 1)
+    h_clean = batch_clean(:, 1)
+
+    ! Calculate statistics
+    noisy_mean = sum(h_noisy) / PATCH_PIXELS
+    clean_mean = sum(h_clean) / PATCH_PIXELS
+
+    noisy_std = sqrt(sum((h_noisy - noisy_mean)**2) / PATCH_PIXELS)
+    clean_std = sqrt(sum((h_clean - clean_mean)**2) / PATCH_PIXELS)
+
+    diff_mean = sum(abs(h_noisy - h_clean)) / PATCH_PIXELS
+    diff_max = maxval(abs(h_noisy - h_clean))
+
+    print *, "First patch statistics:"
+    print *, "  Noisy: mean=", noisy_mean, " std=", noisy_std
+    print *, "  Clean: mean=", clean_mean, " std=", clean_std
+    print *, ""
+    print *, "Difference between noisy and clean:"
+    print *, "  Mean abs diff: ", diff_mean
+    print *, "  Max abs diff:  ", diff_max
+    print *, ""
+
+    ! Check if they're suspiciously similar
+    if (diff_mean < 0.001) then
+        print *, "✗ ERROR: Noisy and clean are nearly identical!"
+        print *, "  Loader might be returning same data for both"
+    else if (noisy_std <= clean_std) then
+        print *, "✗ WARNING: Noisy std <= clean std"
+        print *, "  Expected: noisy should have higher std"
+    else
+        print *, "✓ Data looks reasonable"
+        print *, "  Noisy has higher std than clean (as expected)"
+    end if
+
+    ! Also check if data is in reasonable range
+    print *, ""
+    print *, "Value ranges:"
+    print *, "  Noisy: [", minval(h_noisy), ",", maxval(h_noisy), "]"
+    print *, "  Clean: [", minval(h_clean), ",", maxval(h_clean), "]"
+
+    if (minval(h_noisy) < 0.0 .or. maxval(h_noisy) > 1.0) then
+        print *, "✗ WARNING: Noisy values outside [0, 1] range!"
+    end if
+
+    if (minval(h_clean) < 0.0 .or. maxval(h_clean) > 1.0) then
+        print *, "✗ WARNING: Clean values outside [0, 1] range!"
+    end if
+
+    call cryo_loader_cleanup()
+    deallocate(batch_noisy, batch_clean, h_noisy, h_clean)
+
+end program test_loader

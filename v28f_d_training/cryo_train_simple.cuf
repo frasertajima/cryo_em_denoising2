@@ -1,0 +1,507 @@
+!================================================================
+! Climate U-Net Training Program - v28e
+!================================================================
+! U-Net architecture for weather prediction using streaming data.
+!
+! Input: Weather state at time t (6 channels × 240 lat × 121 lon)
+! Output: Weather state at time t+6h (same dimensions)
+!
+! This replaces the FC baseline with a convolutional U-Net that
+! exploits spatial structure of weather data.
+!
+! Features:
+!   - Training with validation split
+!   - Checkpoint saving after each epoch
+!   - Sample I/O export for Python verification
+!
+! Usage:
+!   ./climate_train_unet --stream              # Streaming mode
+!   ./climate_train_unet --stream --epochs 10  # Custom epochs
+!   ./climate_train_unet --stream --lr 0.0001  # Custom learning rate
+!   ./climate_train_unet --stream --save       # Save checkpoints
+!   ./climate_train_unet --stream --export_samples  # Export I/O for verification
+!================================================================
+
+program climate_train_unet
+    use cudafor
+    use iso_c_binding
+    use dataset_config
+    use streaming_regression_loader
+    use climate_unet_module
+    use unet_export
+    implicit none
+
+    ! cuDNN interface (CUDNN_STATUS_SUCCESS already defined in pooling_cudnn)
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    ! U-Net batch size (smaller than FC baseline due to memory needs)
+    integer, parameter :: UNET_BATCH_SIZE = 8
+
+    ! Training parameters
+    integer :: num_epochs = 5
+    real(4) :: learning_rate = 0.0001  ! Lower default LR for U-Net stability
+    integer :: max_batches = -1  ! -1 means all batches
+    logical :: save_checkpoints = .false.
+    logical :: export_samples = .false.
+    character(len=256) :: checkpoint_dir = "saved_models/climate_unet/"
+
+    ! Validation parameters (use last 10% of data)
+    integer :: val_samples
+    integer :: val_batches
+    real(4) :: val_split = 0.1  ! 10% for validation
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+
+    ! U-Net model
+    type(climate_unet_t) :: model
+
+    ! Data buffers (flat format from streaming loader)
+    real(4), managed, allocatable :: batch_input_flat(:,:)   ! (features, batch)
+    real(4), managed, allocatable :: batch_target_flat(:,:)  ! (features, batch)
+
+    ! 4D tensors for U-Net (NCHW format)
+    real(4), device, allocatable :: batch_input_4d(:,:,:,:)  ! (batch, channels, H, W)
+    real(4), device, allocatable :: batch_target_4d(:,:,:,:)
+    real(4), device, allocatable :: batch_output_4d(:,:,:,:)
+    real(4), device, allocatable :: batch_grad_4d(:,:,:,:)
+
+    ! Training state
+    integer :: epoch, batch_num, timestep
+    integer :: actual_batch_size, total_batches, train_batches
+    real(4) :: batch_loss, epoch_loss, avg_loss
+    real(4) :: val_loss, val_avg_loss
+    real(4) :: epoch_start_time, epoch_end_time
+    integer :: samples_processed, val_samples_processed
+    integer :: istat
+    real(4) :: best_val_loss
+    integer :: samples_exported
+
+    ! Parse command line args
+    call parse_training_args()
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Climate U-Net Training - v28e"
+    print *, "=============================================="
+    print '(A,I8)', "  Epochs:        ", num_epochs
+    print '(A,F10.6)', "  Learning rate: ", learning_rate
+    print '(A,I8)', "  Batch size:    ", UNET_BATCH_SIZE
+    print '(A,F6.1,A)', "  Val split:     ", val_split * 100, "%"
+    if (save_checkpoints) then
+        print '(A,A)', "  Checkpoints:   ", trim(checkpoint_dir)
+    else
+        print *, "  Checkpoints:   disabled (use --save to enable)"
+    endif
+    if (export_samples) then
+        print *, "  Sample export: enabled"
+    endif
+
+    ! Initialize cuDNN
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "  cuDNN initialized"
+
+    ! Load dataset (streaming mode) - skip test data to save memory
+    call load_dataset_streaming_no_test()
+
+    if (.not. streaming_mode_active) then
+        print *, "ERROR: This training requires streaming mode"
+        print *, "       Run with: ./climate_train_unet --stream"
+        stop 1
+    endif
+
+    ! Initialize U-Net model with smaller batch size
+    call unet_init(model, cudnn_handle, UNET_BATCH_SIZE)
+
+    ! Allocate flat buffers (used by streaming loader)
+    allocate(batch_input_flat(input_size, UNET_BATCH_SIZE))
+    allocate(batch_target_flat(output_size, UNET_BATCH_SIZE))
+
+    ! Allocate 4D tensors (used by U-Net)
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    allocate(batch_input_4d(LON, LAT, N_CHANNELS, UNET_BATCH_SIZE))
+    allocate(batch_target_4d(LON, LAT, N_CHANNELS, UNET_BATCH_SIZE))
+    allocate(batch_output_4d(LON, LAT, N_CHANNELS, UNET_BATCH_SIZE))
+    allocate(batch_grad_4d(LON, LAT, N_CHANNELS, UNET_BATCH_SIZE))
+
+    total_batches = regression_streaming_get_num_batches()
+    timestep = 0
+
+    ! Split into train/val (use last val_split% for validation)
+    val_batches = int(total_batches * val_split)
+    train_batches = total_batches - val_batches
+    best_val_loss = 1.0e10
+    samples_exported = 0
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Starting Training"
+    print *, "=============================================="
+    print '(A,I8)', "  Total batches/epoch: ", total_batches
+    print '(A,I8)', "  Train batches:       ", train_batches
+    print '(A,I8)', "  Val batches:         ", val_batches
+    print *, ""
+
+    ! Training loop
+    do epoch = 1, num_epochs
+        call cpu_time(epoch_start_time)
+
+        call dataset_start_epoch()
+        epoch_loss = 0.0
+        samples_processed = 0
+        batch_num = 0
+
+        ! === TRAINING PHASE ===
+        do
+            ! Get next batch (flat format)
+            call dataset_get_batch(batch_input_flat, batch_target_flat, actual_batch_size)
+            if (actual_batch_size <= 0) exit
+
+            batch_num = batch_num + 1
+            timestep = timestep + 1
+
+            ! Early exit for testing
+            if (max_batches > 0 .and. batch_num > max_batches) exit
+
+            ! Stop before validation batches
+            if (batch_num > train_batches) exit
+
+            ! Reshape flat -> 4D (features are stored as C*H*W flattened)
+            call reshape_flat_to_4d(batch_input_flat, batch_input_4d, &
+                                   actual_batch_size, N_CHANNELS, LAT, LON)
+            call reshape_flat_to_4d(batch_target_flat, batch_target_4d, &
+                                   actual_batch_size, N_CHANNELS, LAT, LON)
+
+            ! Forward pass
+            call unet_forward(model, batch_input_4d, batch_output_4d)
+
+            ! Compute MSE loss and gradient
+            call compute_mse_loss_4d(batch_output_4d, batch_target_4d, batch_grad_4d, &
+                                    actual_batch_size, batch_loss)
+
+            ! Export sample I/O for verification (first 5 samples from first epoch)
+            ! IMPORTANT: Export BEFORE backward pass so weights match activations!
+            if (export_samples .and. epoch == 1 .and. samples_exported < 5) then
+                call export_sample_io(batch_input_4d, batch_output_4d, &
+                                     trim(checkpoint_dir), samples_exported)
+                ! Also export debug activations and weights for first sample only
+                if (samples_exported == 0) then
+                    call export_debug_activations(model, trim(checkpoint_dir))
+                    ! Export weights that match these activations (BEFORE backward updates them!)
+                    call export_unet_model(model, trim(checkpoint_dir) // "debug_weights/", batch_loss, 0)
+                endif
+                samples_exported = samples_exported + 1
+            endif
+
+            ! Backward pass
+            call unet_backward(model, batch_input_4d, batch_output_4d, batch_grad_4d)
+
+            ! Update weights
+            call unet_update(model, learning_rate, timestep)
+
+            epoch_loss = epoch_loss + batch_loss * actual_batch_size
+            samples_processed = samples_processed + actual_batch_size
+
+            ! Progress update every 1000 batches
+            if (mod(batch_num, 1000) == 0) then
+                avg_loss = epoch_loss / samples_processed
+                print '(A,I2,A,I5,A,I5,A,F10.6,A,F8.4)', &
+                    "  Epoch ", epoch, " | Batch ", batch_num, "/", train_batches, &
+                    " | Loss: ", avg_loss, " | RMSE: ", sqrt(avg_loss)
+            endif
+        end do
+
+        avg_loss = epoch_loss / samples_processed
+
+        ! === VALIDATION PHASE ===
+        ! Skip validation if using max_batches (quick testing mode)
+        val_loss = 0.0
+        val_samples_processed = 0
+
+        if (max_batches > 0) then
+            ! Quick test mode - skip validation, just save checkpoint
+            val_avg_loss = avg_loss  ! Use train loss as proxy
+            goto 100  ! Skip to checkpoint saving
+        endif
+
+        do while (batch_num <= total_batches)
+            call dataset_get_batch(batch_input_flat, batch_target_flat, actual_batch_size)
+            if (actual_batch_size <= 0) exit
+
+            batch_num = batch_num + 1
+
+            ! Reshape flat -> 4D
+            call reshape_flat_to_4d(batch_input_flat, batch_input_4d, &
+                                   actual_batch_size, N_CHANNELS, LAT, LON)
+            call reshape_flat_to_4d(batch_target_flat, batch_target_4d, &
+                                   actual_batch_size, N_CHANNELS, LAT, LON)
+
+            ! Forward pass only (no backward, no update)
+            call unet_forward(model, batch_input_4d, batch_output_4d)
+
+            ! Compute MSE loss (no gradient needed)
+            call compute_mse_loss_4d(batch_output_4d, batch_target_4d, batch_grad_4d, &
+                                    actual_batch_size, batch_loss)
+
+            val_loss = val_loss + batch_loss * actual_batch_size
+            val_samples_processed = val_samples_processed + actual_batch_size
+        end do
+
+        if (val_samples_processed > 0) then
+            val_avg_loss = val_loss / val_samples_processed
+        else
+            val_avg_loss = 0.0
+        endif
+
+        call cpu_time(epoch_end_time)
+
+100     continue  ! Label for skipping validation in quick test mode
+
+        ! Epoch summary
+        print *, ""
+        print '(A,I2,A)', "  ===== Epoch ", epoch, " Complete ====="
+        print '(A,F10.6)', "  Train Loss: ", avg_loss
+        print '(A,F10.6)', "  Train RMSE: ", sqrt(avg_loss)
+        if (val_samples_processed > 0) then
+            print '(A,F10.6)', "  Val Loss:   ", val_avg_loss
+            print '(A,F10.6)', "  Val RMSE:   ", sqrt(val_avg_loss)
+        endif
+        print '(A,F8.2,A)', "  Time:       ", epoch_end_time - epoch_start_time, " seconds"
+        print '(A,F8.2,A)', "  Throughput: ", samples_processed / (epoch_end_time - epoch_start_time), " samples/sec"
+
+        ! Save checkpoint if enabled
+        if (save_checkpoints) then
+            if (val_avg_loss < best_val_loss) then
+                best_val_loss = val_avg_loss
+                print *, "  New best model! Saving checkpoint..."
+                call export_unet_checkpoint(model, checkpoint_dir, val_avg_loss, epoch)
+            else
+                print '(A,F10.6)', "  Best val loss: ", best_val_loss
+            endif
+        endif
+        print *, ""
+
+    end do
+
+    print *, "=============================================="
+    print *, "  Training Complete"
+    print *, "=============================================="
+
+    ! Cleanup
+    deallocate(batch_input_flat, batch_target_flat)
+    deallocate(batch_input_4d, batch_target_4d, batch_output_4d, batch_grad_4d)
+    call unet_cleanup(model)
+    call dataset_cleanup()
+    istat = cudnnDestroy(cudnn_handle)
+
+contains
+
+    !================================================================
+    ! Reshape flat array to 4D tensor
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine reshape_flat_to_4d(flat, tensor_4d, batch_size, channels, height, width)
+        real(4), managed, intent(in) :: flat(:,:)           ! (C*H*W, batch)
+        real(4), device, intent(out) :: tensor_4d(:,:,:,:)  ! (W, H, C, batch) = (W,H,C,N)
+        integer, intent(in) :: batch_size, channels, height, width
+
+        integer :: b, c, h, w, flat_idx
+
+        ! The flat data is stored as (C*H*W, batch) where features are contiguous
+        ! We need to convert to (W, H, C, batch) for cuDNN via F-order
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, channels
+                do h = 1, height
+                    do w = 1, width
+                        ! Flat index: features stored as C-major (C varies slowest)
+                        ! flat_idx = (c-1)*H*W + (h-1)*W + w
+                        flat_idx = (c-1) * height * width + (h-1) * width + w
+                        tensor_4d(w, h, c, b) = flat(flat_idx, b)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine reshape_flat_to_4d
+
+    !================================================================
+    ! Reshape 4D tensor back to flat array
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine reshape_4d_to_flat(tensor_4d, flat, batch_size, channels, height, width)
+        real(4), device, intent(in) :: tensor_4d(:,:,:,:)   ! (W, H, C, batch) = (W,H,C,N)
+        real(4), managed, intent(out) :: flat(:,:)          ! (C*H*W, batch)
+        integer, intent(in) :: batch_size, channels, height, width
+
+        integer :: b, c, h, w, flat_idx
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, channels
+                do h = 1, height
+                    do w = 1, width
+                        flat_idx = (c-1) * height * width + (h-1) * width + w
+                        flat(flat_idx, b) = tensor_4d(w, h, c, b)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine reshape_4d_to_flat
+
+    !================================================================
+    ! MSE Loss for 4D tensors
+    ! Gradient computed on GPU, loss on host (GPU reduction unreliable)
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine compute_mse_loss_4d(output, target, grad, batch_size, loss)
+        real(4), device, intent(in) :: output(:,:,:,:)   ! (W, H, C, batch) = (W,H,C,N)
+        real(4), device, intent(in) :: target(:,:,:,:)
+        real(4), device, intent(out) :: grad(:,:,:,:)
+        integer, intent(in) :: batch_size
+        real(4), intent(out) :: loss
+
+        real(4) :: scale
+        integer :: b, c, h, w
+        integer :: total_elements, wd, ht, ch
+        real(4), allocatable :: h_out(:,:,:,:), h_tgt(:,:,:,:)
+        integer :: istat
+
+        ! Dimensions are now (W, H, C, N)
+        wd = size(output, 1)
+        ht = size(output, 2)
+        ch = size(output, 3)
+        total_elements = batch_size * ch * ht * wd
+        scale = 2.0 / real(total_elements)
+
+        ! Compute gradient on GPU
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, ch
+                do h = 1, ht
+                    do w = 1, wd
+                        grad(w, h, c, b) = scale * (output(w, h, c, b) - target(w, h, c, b))
+                    end do
+                end do
+            end do
+        end do
+
+        ! Compute loss on host
+        allocate(h_out(wd, ht, ch, batch_size))
+        allocate(h_tgt(wd, ht, ch, batch_size))
+        h_out = output(:, :, :, 1:batch_size)
+        h_tgt = target(:, :, :, 1:batch_size)
+        istat = cudaDeviceSynchronize()
+        loss = sum((h_out - h_tgt)**2) / real(total_elements)
+        deallocate(h_out, h_tgt)
+
+    end subroutine compute_mse_loss_4d
+
+    !================================================================
+    ! Parse command line arguments
+    !================================================================
+    subroutine parse_training_args()
+        character(len=256) :: arg
+        integer :: i, num_args
+
+        num_args = command_argument_count()
+        i = 1
+        do while (i <= num_args)
+            call get_command_argument(i, arg)
+
+            if (trim(arg) == '--epochs') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) num_epochs
+            else if (trim(arg) == '--lr') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) learning_rate
+            else if (trim(arg) == '--max_batches') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) max_batches
+            else if (trim(arg) == '--save') then
+                save_checkpoints = .true.
+            else if (trim(arg) == '--export_samples') then
+                export_samples = .true.
+            else if (trim(arg) == '--checkpoint_dir') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                checkpoint_dir = trim(arg) // "/"
+            else if (trim(arg) == '--val_split') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) val_split
+            endif
+
+            i = i + 1
+        end do
+
+        ! Create checkpoint directory if saving
+        if (save_checkpoints .or. export_samples) then
+            call system("mkdir -p " // trim(checkpoint_dir))
+        endif
+    end subroutine parse_training_args
+
+    !================================================================
+    ! Load dataset in streaming mode WITHOUT loading test data
+    ! This saves ~7.5GB of GPU memory for the backward pass
+    !================================================================
+    subroutine load_dataset_streaming_no_test()
+        character(len=*), parameter :: DATA_DIR = 'climate_data_streaming/'
+
+        call parse_cmdline_args()
+
+        if (show_help) then
+            print *, "Usage: ./climate_train_unet --stream [--epochs N] [--lr RATE]"
+            stop
+        endif
+
+        streaming_mode_active = use_streaming
+
+        print *, "======================================================================"
+        print *, "Loading Climate Dataset (STREAMING MODE - No Test Data)"
+        print *, "======================================================================"
+        print '(A,I8)',       "   Training samples: ", train_samples
+        print '(A,I8)',       "   Channels:         ", N_CHANNELS
+        print '(A,I4,A,I4)',  "   Spatial:          ", LAT, " x ", LON
+        print '(A,I8)',       "   Features/sample:  ", input_size
+        print '(A,F8.2,A)',   "   Train data size:  ", &
+              real(int(train_samples,8) * int(input_size,8) * 4 * 2) / (1024.0**3), " GB"
+        print *, "   Mode:             STREAMING (no test data loaded)"
+
+        ! Initialize regression streaming loader with our batch size
+        call regression_streaming_init( &
+            DATA_DIR//'inputs_train_stream.bin', &
+            DATA_DIR//'outputs_train_stream.bin', &
+            int(train_samples, 8), &
+            input_size, &
+            UNET_BATCH_SIZE)
+
+        call regression_streaming_set_shuffle_mode(REG_SHUFFLE_BLOCK, 50)
+
+        print *, ""
+        print *, "Streaming mode ready! (Test data NOT loaded to save memory)"
+        print *, "======================================================================"
+
+    end subroutine load_dataset_streaming_no_test
+
+end program climate_train_unet

@@ -1,0 +1,163 @@
+!================================================================
+! Debug Training Test
+!================================================================
+! Same as quick_train but with diagnostic output
+!================================================================
+program debug_train
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    ! cuDNN C interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    ! Training configuration
+    integer, parameter :: IMAGE_SIZE = 128
+    integer, parameter :: BATCH_SIZE = 4
+    integer, parameter :: NUM_STEPS = 100  ! Fewer steps for debugging
+    integer, parameter :: PRINT_EVERY = 10
+    real(4), parameter :: LEARNING_RATE = 0.0001  ! Lower LR
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+    integer :: stat
+
+    ! Network layers
+    type(conv2d_layer_t) :: conv1, conv2
+
+    ! Device arrays
+    real(4), device, allocatable :: input(:,:,:,:)
+    real(4), device, allocatable :: target(:,:,:,:)
+    real(4), device, allocatable :: conv1_out(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+    real(4), device, allocatable :: grad_conv1(:,:,:,:)
+    real(4), device, allocatable :: grad_input(:,:,:,:)
+
+    ! Host arrays
+    real(4), allocatable :: host_input(:,:,:,:)
+    real(4), allocatable :: host_target(:,:,:,:)
+    real(4), allocatable :: host_output(:,:,:,:)
+    real(4), allocatable :: host_diff(:,:,:,:)
+    real(4), allocatable :: grad_check(:,:,:,:)
+    real(4), allocatable :: grad_check_1d(:)
+
+    ! Training metrics
+    real(4) :: loss, grad_max, grad_mean
+    integer :: step
+
+    print *, ""
+    print *, "======================================================================"
+    print *, "  Debug Training - Gradient Monitoring"
+    print *, "======================================================================"
+    print *, ""
+
+    ! Initialize cuDNN
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) stop "cuDNN init failed"
+
+    ! Initialize network
+    call conv2d_init(conv1, cudnn_handle, 1, 16, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.true.)
+    call conv2d_init(conv2, cudnn_handle, 16, 1, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    ! Allocate arrays
+    allocate(input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv1_out(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_conv1(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(host_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_diff(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_check(16, 1, 3, 3))
+    allocate(grad_check_1d(16))
+
+    ! Load training data
+    print *, "Loading data..."
+    call load_training_data()
+    print *, "Data loaded OK"
+
+    print *, "LR:", LEARNING_RATE
+    print *, "Steps:", NUM_STEPS
+    print *, ""
+    print '(A6, A12, A12, A12, A12)', "Step", "Loss", "Conv1_w", "Conv1_b", "Conv2_w"
+    print *, "----------------------------------------------------------------------"
+
+    do step = 1, NUM_STEPS
+        ! Forward pass
+        print *, "Step", step, ": forward..."
+        call conv2d_forward(conv1, input, conv1_out)
+        call conv2d_forward(conv2, conv1_out, output)
+        print *, "  forward OK"
+
+        ! Compute loss and gradient
+        host_output = output
+        host_diff = host_output - host_target
+        loss = sum(host_diff**2) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+        host_diff = 2.0 * host_diff / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+        grad_output = host_diff
+
+        ! Backward pass
+        call conv2d_backward(conv2, conv1_out, output, grad_output, grad_conv1, compute_grad_input=.true.)
+        call conv2d_backward(conv1, input, conv1_out, grad_conv1, grad_input, compute_grad_input=.false.)
+
+        ! Check gradient magnitudes
+        if (mod(step, PRINT_EVERY) == 0 .or. step == 1) then
+            grad_check = conv1%grad_weights
+            grad_max = maxval(abs(grad_check))
+            print '(I6, ES12.4, ES12.4, ES12.4, ES12.4)', step, loss, &
+                grad_max, maxval(abs(conv1%grad_bias)), maxval(abs(conv2%grad_weights))
+
+            ! Check for NaN or Inf
+            if (loss /= loss .or. abs(loss) > 1.0e10) then
+                print *, ""
+                print *, "ERROR: Loss is NaN or Inf! Stopping."
+                stop
+            end if
+        end if
+
+        ! Update weights with Adam
+        call conv2d_update(conv1, LEARNING_RATE, step)
+        call conv2d_update(conv2, LEARNING_RATE, step)
+    end do
+
+    print *, "----------------------------------------------------------------------"
+    print *, ""
+    print *, "Final loss:", loss
+    print *, ""
+
+contains
+
+    subroutine load_training_data()
+        integer :: i, j, b
+
+        ! Generate simple synthetic data
+        do b = 1, BATCH_SIZE
+            do j = 1, IMAGE_SIZE
+                do i = 1, IMAGE_SIZE
+                    ! Simple checkerboard target
+                    host_target(1, i, j, b) = real(mod(i/16 + j/16, 2))
+                end do
+            end do
+        end do
+
+        ! Add noise
+        call random_number(host_input)
+        host_input = host_target + 0.1 * (host_input - 0.5)
+
+        input = host_input
+        target = host_target
+    end subroutine
+
+end program debug_train

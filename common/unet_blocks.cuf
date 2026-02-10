@@ -1,0 +1,477 @@
+!================================================================
+! U-Net Building Blocks - Encoder and Decoder
+!================================================================
+! Provides reusable encoder and decoder blocks for U-Net architecture.
+! Uses cuDNN via conv2d_cudnn and pooling_cudnn modules.
+!
+! Encoder Block:
+!   Input -> Conv+ReLU -> Conv+ReLU -> MaxPool -> Output
+!   Also outputs pre-pool features for skip connection
+!
+! Decoder Block:
+!   Input + Skip -> Upsample -> Concat -> Conv+ReLU -> Conv+ReLU -> Output
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-22
+!================================================================
+module unet_blocks
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    use pooling_cudnn
+    implicit none
+
+    !================================================================
+    ! Encoder Block Type
+    !================================================================
+    type :: encoder_block_t
+        type(conv2d_layer_t) :: conv1
+        type(conv2d_layer_t) :: conv2
+        type(maxpool2d_layer_t) :: pool
+
+        integer :: in_channels
+        integer :: out_channels
+        integer :: batch_size
+        integer :: in_height, in_width
+        integer :: out_height, out_width  ! After pooling
+
+        ! Intermediate outputs (for backward pass)
+        real(4), device, allocatable :: conv1_out(:,:,:,:)
+        real(4), device, allocatable :: conv2_out(:,:,:,:)  ! Also skip connection
+
+        logical :: initialized = .false.
+    end type encoder_block_t
+
+    !================================================================
+    ! Decoder Block Type
+    !================================================================
+    type :: decoder_block_t
+        type(upsample2d_layer_t) :: upsample
+        type(conv2d_layer_t) :: conv1
+        type(conv2d_layer_t) :: conv2
+
+        integer :: in_channels      ! From previous decoder/bottleneck
+        integer :: skip_channels    ! From encoder skip connection
+        integer :: out_channels
+        integer :: batch_size
+        integer :: in_height, in_width
+        integer :: out_height, out_width  ! After upsampling
+
+        ! Intermediate outputs
+        real(4), device, allocatable :: upsampled(:,:,:,:)
+        real(4), device, allocatable :: concatenated(:,:,:,:)
+        real(4), device, allocatable :: conv1_out(:,:,:,:)
+
+        logical :: initialized = .false.
+    end type decoder_block_t
+
+    public :: encoder_block_t, decoder_block_t
+    public :: encoder_init, encoder_forward, encoder_backward, encoder_update, encoder_cleanup
+    public :: decoder_init, decoder_forward, decoder_backward, decoder_update, decoder_cleanup
+
+contains
+
+    !================================================================
+    ! Initialize Encoder Block
+    !================================================================
+    subroutine encoder_init(block, handle, in_channels, out_channels, &
+                           batch_size, in_height, in_width)
+        type(encoder_block_t), intent(inout) :: block
+        type(c_ptr), intent(in) :: handle
+        integer, intent(in) :: in_channels, out_channels
+        integer, intent(in) :: batch_size, in_height, in_width
+
+        block%in_channels = in_channels
+        block%out_channels = out_channels
+        block%batch_size = batch_size
+        block%in_height = in_height
+        block%in_width = in_width
+        block%out_height = in_height / 2
+        block%out_width = in_width / 2
+
+        ! Conv1: in_channels -> out_channels, 3x3, pad=1, with ReLU
+        call conv2d_init(block%conv1, handle, in_channels, out_channels, &
+                        3, 1, 1, batch_size, in_height, in_width, use_relu=.true.)
+
+        ! Conv2: out_channels -> out_channels, 3x3, pad=1, with ReLU
+        call conv2d_init(block%conv2, handle, out_channels, out_channels, &
+                        3, 1, 1, batch_size, in_height, in_width, use_relu=.true.)
+
+        ! MaxPool: 2x2, stride 2
+        call maxpool2d_init(block%pool, handle, 2, 2, batch_size, out_channels, &
+                           in_height, in_width)
+
+        ! Allocate intermediate buffers
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(block%conv1_out(in_width, in_height, out_channels, batch_size))
+        allocate(block%conv2_out(in_width, in_height, out_channels, batch_size))
+
+        block%initialized = .true.
+
+    end subroutine encoder_init
+
+    !================================================================
+    ! Encoder Forward Pass
+    ! Returns both pooled output and skip connection (pre-pool)
+    !================================================================
+    subroutine encoder_forward(block, input, output, skip_output)
+        type(encoder_block_t), intent(inout) :: block
+        real(4), device, intent(in) :: input(*)
+        real(4), device, intent(out) :: output(*)       ! Pooled output
+        real(4), device, intent(out) :: skip_output(*)  ! Skip connection (pre-pool)
+
+        ! Conv1 + ReLU
+        call conv2d_forward(block%conv1, input, block%conv1_out)
+
+        ! Conv2 + ReLU
+        call conv2d_forward(block%conv2, block%conv1_out, block%conv2_out)
+
+        ! Copy conv2_out to skip_output for skip connection
+        call copy_to_output(block%conv2_out, skip_output, size(block%conv2_out))
+
+        ! MaxPool
+        call maxpool2d_forward(block%pool, block%conv2_out, output)
+
+    end subroutine encoder_forward
+
+    !================================================================
+    ! Encoder Backward Pass
+    !================================================================
+    subroutine encoder_backward(block, input, grad_output, grad_skip, grad_input)
+        type(encoder_block_t), intent(inout) :: block
+        real(4), device, intent(in) :: input(*)         ! Original input
+        real(4), device, intent(in) :: grad_output(*)   ! Gradient from pooled output
+        real(4), device, intent(in) :: grad_skip(*)     ! Gradient from skip connection
+        real(4), device, intent(out) :: grad_input(*)   ! Gradient to previous layer
+
+        real(4), device, allocatable :: grad_pool(:,:,:,:)
+        real(4), device, allocatable :: grad_conv2(:,:,:,:)
+        real(4), device, allocatable :: grad_conv1(:,:,:,:)
+        integer :: n, c, h, w
+
+        n = block%batch_size
+        c = block%out_channels
+        h = block%in_height
+        w = block%in_width
+
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(grad_pool(w, h, c, n))
+        allocate(grad_conv2(w, h, c, n))
+        allocate(grad_conv1(w, h, c, n))
+
+        ! Backward through MaxPool
+        call maxpool2d_backward(block%pool, block%conv2_out, grad_output, &
+                               grad_output, grad_pool)
+
+        ! Add gradient from skip connection
+        call add_gradients(grad_pool, grad_skip, size(grad_pool))
+
+        ! Backward through Conv2
+        call conv2d_backward(block%conv2, block%conv1_out, block%conv2_out, &
+                            grad_pool, grad_conv2)
+
+        ! Backward through Conv1
+        call conv2d_backward(block%conv1, input, block%conv1_out, &
+                            grad_conv2, grad_input)
+
+        deallocate(grad_pool, grad_conv2, grad_conv1)
+
+    end subroutine encoder_backward
+
+    !================================================================
+    ! Encoder Update Weights
+    !================================================================
+    subroutine encoder_update(block, lr, timestep)
+        type(encoder_block_t), intent(inout) :: block
+        real(4), intent(in) :: lr
+        integer, intent(in) :: timestep
+
+        call conv2d_update(block%conv1, lr, timestep)
+        call conv2d_update(block%conv2, lr, timestep)
+
+    end subroutine encoder_update
+
+    !================================================================
+    ! Encoder Cleanup
+    !================================================================
+    subroutine encoder_cleanup(block)
+        type(encoder_block_t), intent(inout) :: block
+
+        if (.not. block%initialized) return
+
+        call conv2d_cleanup(block%conv1)
+        call conv2d_cleanup(block%conv2)
+        call maxpool2d_cleanup(block%pool)
+
+        if (allocated(block%conv1_out)) deallocate(block%conv1_out)
+        if (allocated(block%conv2_out)) deallocate(block%conv2_out)
+
+        block%initialized = .false.
+
+    end subroutine encoder_cleanup
+
+    !================================================================
+    ! Initialize Decoder Block
+    !================================================================
+    subroutine decoder_init(block, handle, in_channels, skip_channels, out_channels, &
+                           batch_size, in_height, in_width)
+        type(decoder_block_t), intent(inout) :: block
+        type(c_ptr), intent(in) :: handle
+        integer, intent(in) :: in_channels, skip_channels, out_channels
+        integer, intent(in) :: batch_size, in_height, in_width
+
+        integer :: concat_channels
+
+        block%in_channels = in_channels
+        block%skip_channels = skip_channels
+        block%out_channels = out_channels
+        block%batch_size = batch_size
+        block%in_height = in_height
+        block%in_width = in_width
+        block%out_height = in_height * 2
+        block%out_width = in_width * 2
+
+        concat_channels = in_channels + skip_channels
+
+        ! Upsample: 2x scale
+        call upsample2d_init(block%upsample, 2, batch_size, in_channels, &
+                            in_height, in_width)
+
+        ! Conv1: concat_channels -> out_channels, 3x3, pad=1, with ReLU
+        call conv2d_init(block%conv1, handle, concat_channels, out_channels, &
+                        3, 1, 1, batch_size, block%out_height, block%out_width, use_relu=.true.)
+
+        ! Conv2: out_channels -> out_channels, 3x3, pad=1, with ReLU
+        call conv2d_init(block%conv2, handle, out_channels, out_channels, &
+                        3, 1, 1, batch_size, block%out_height, block%out_width, use_relu=.true.)
+
+        ! Allocate intermediate buffers
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(block%upsampled(block%out_width, block%out_height, in_channels, batch_size))
+        allocate(block%concatenated(block%out_width, block%out_height, concat_channels, batch_size))
+        allocate(block%conv1_out(block%out_width, block%out_height, out_channels, batch_size))
+
+        block%initialized = .true.
+
+    end subroutine decoder_init
+
+    !================================================================
+    ! Decoder Forward Pass
+    !================================================================
+    subroutine decoder_forward(block, input, skip_input, output)
+        type(decoder_block_t), intent(inout) :: block
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        real(4), device, intent(in) :: input(block%in_width, block%in_height, &
+                                             block%in_channels, block%batch_size)
+        real(4), device, intent(in) :: skip_input(block%out_width, block%out_height, &
+                                                  block%skip_channels, block%batch_size)
+        real(4), device, intent(out) :: output(*)
+
+        ! Upsample
+        call upsample2d_forward(block%upsample, input, block%upsampled)
+
+        ! Concatenate upsampled with skip connection
+        call concatenate_channels(block%upsampled, skip_input, block%concatenated, &
+                                 block%batch_size, block%in_channels, block%skip_channels, &
+                                 block%out_height, block%out_width)
+
+        ! Conv1 + ReLU
+        call conv2d_forward(block%conv1, block%concatenated, block%conv1_out)
+
+        ! Conv2 + ReLU
+        call conv2d_forward(block%conv2, block%conv1_out, output)
+
+    end subroutine decoder_forward
+
+    !================================================================
+    ! Decoder Backward Pass
+    !================================================================
+    subroutine decoder_backward(block, input, skip_input, output, grad_output, &
+                               grad_input, grad_skip)
+        type(decoder_block_t), intent(inout) :: block
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        real(4), device, intent(in) :: input(block%in_width, block%in_height, &
+                                             block%in_channels, block%batch_size)
+        real(4), device, intent(in) :: skip_input(block%out_width, block%out_height, &
+                                                  block%skip_channels, block%batch_size)
+        real(4), device, intent(in) :: output(*)
+        real(4), device, intent(inout) :: grad_output(*)
+        real(4), device, intent(out) :: grad_input(block%in_width, block%in_height, &
+                                                   block%in_channels, block%batch_size)
+        real(4), device, intent(out) :: grad_skip(block%out_width, block%out_height, &
+                                                  block%skip_channels, block%batch_size)
+
+        real(4), device, allocatable :: grad_conv1(:,:,:,:)
+        real(4), device, allocatable :: grad_concat(:,:,:,:)
+        real(4), device, allocatable :: grad_upsampled(:,:,:,:)
+        integer :: concat_ch
+
+        concat_ch = block%in_channels + block%skip_channels
+
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(grad_conv1(block%out_width, block%out_height, block%out_channels, block%batch_size))
+        allocate(grad_concat(block%out_width, block%out_height, concat_ch, block%batch_size))
+        allocate(grad_upsampled(block%out_width, block%out_height, block%in_channels, block%batch_size))
+
+        ! Backward through Conv2
+        call conv2d_backward(block%conv2, block%conv1_out, output, grad_output, grad_conv1)
+
+        ! Backward through Conv1
+        call conv2d_backward(block%conv1, block%concatenated, block%conv1_out, grad_conv1, grad_concat)
+
+        ! Split gradient for concatenation
+        call split_gradient_channels(grad_concat, grad_upsampled, grad_skip, &
+                                    block%batch_size, block%in_channels, block%skip_channels, &
+                                    block%out_height, block%out_width)
+
+        ! Backward through Upsample
+        call upsample2d_backward(block%upsample, grad_upsampled, grad_input)
+
+        deallocate(grad_conv1, grad_concat, grad_upsampled)
+
+    end subroutine decoder_backward
+
+    !================================================================
+    ! Decoder Update Weights
+    !================================================================
+    subroutine decoder_update(block, lr, timestep)
+        type(decoder_block_t), intent(inout) :: block
+        real(4), intent(in) :: lr
+        integer, intent(in) :: timestep
+
+        call conv2d_update(block%conv1, lr, timestep)
+        call conv2d_update(block%conv2, lr, timestep)
+
+    end subroutine decoder_update
+
+    !================================================================
+    ! Decoder Cleanup
+    !================================================================
+    subroutine decoder_cleanup(block)
+        type(decoder_block_t), intent(inout) :: block
+
+        if (.not. block%initialized) return
+
+        call upsample2d_cleanup(block%upsample)
+        call conv2d_cleanup(block%conv1)
+        call conv2d_cleanup(block%conv2)
+
+        if (allocated(block%upsampled)) deallocate(block%upsampled)
+        if (allocated(block%concatenated)) deallocate(block%concatenated)
+        if (allocated(block%conv1_out)) deallocate(block%conv1_out)
+
+        block%initialized = .false.
+
+    end subroutine decoder_cleanup
+
+    !================================================================
+    ! Helper: Copy to output array
+    !================================================================
+    subroutine copy_to_output(src, dst, n)
+        real(4), device, intent(in) :: src(*)
+        real(4), device, intent(out) :: dst(*)
+        integer, intent(in) :: n
+
+        integer :: i
+
+        !$cuf kernel do(1) <<< *, 256 >>>
+        do i = 1, n
+            dst(i) = src(i)
+        end do
+
+    end subroutine copy_to_output
+
+    !================================================================
+    ! Helper: Add gradients in-place
+    !================================================================
+    subroutine add_gradients(dst, src, n)
+        real(4), device, intent(inout) :: dst(*)
+        real(4), device, intent(in) :: src(*)
+        integer, intent(in) :: n
+
+        integer :: i
+
+        !$cuf kernel do(1) <<< *, 256 >>>
+        do i = 1, n
+            dst(i) = dst(i) + src(i)
+        end do
+
+    end subroutine add_gradients
+
+    !================================================================
+    ! Helper: Concatenate along channel dimension
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine concatenate_channels(a, b, out, batch, ch_a, ch_b, h, w)
+        real(4), device, intent(in) :: a(w, h, ch_a, batch)
+        real(4), device, intent(in) :: b(w, h, ch_b, batch)
+        real(4), device, intent(out) :: out(w, h, ch_a + ch_b, batch)
+        integer, intent(in) :: batch, ch_a, ch_b, h, w
+
+        integer :: n, c, i, j
+
+        ! Copy channels from a
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, ch_a
+                do i = 1, h
+                    do j = 1, w
+                        out(j, i, c, n) = a(j, i, c, n)
+                    end do
+                end do
+            end do
+        end do
+
+        ! Copy channels from b
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, ch_b
+                do i = 1, h
+                    do j = 1, w
+                        out(j, i, ch_a + c, n) = b(j, i, c, n)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine concatenate_channels
+
+    !================================================================
+    ! Helper: Split gradient along channel dimension
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine split_gradient_channels(grad_in, grad_a, grad_b, batch, ch_a, ch_b, h, w)
+        real(4), device, intent(in) :: grad_in(w, h, ch_a + ch_b, batch)
+        real(4), device, intent(out) :: grad_a(w, h, ch_a, batch)
+        real(4), device, intent(out) :: grad_b(w, h, ch_b, batch)
+        integer, intent(in) :: batch, ch_a, ch_b, h, w
+
+        integer :: n, c, i, j
+
+        ! Copy gradients for a
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, ch_a
+                do i = 1, h
+                    do j = 1, w
+                        grad_a(j, i, c, n) = grad_in(j, i, c, n)
+                    end do
+                end do
+            end do
+        end do
+
+        ! Copy gradients for b
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, ch_b
+                do i = 1, h
+                    do j = 1, w
+                        grad_b(j, i, c, n) = grad_in(j, i, ch_a + c, n)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine split_gradient_channels
+
+end module unet_blocks

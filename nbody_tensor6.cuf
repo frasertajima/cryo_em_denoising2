@@ -1,0 +1,254 @@
+module nbody_tensor
+    use cudafor
+    use cublas_v2
+    use iso_c_binding
+    use cuda_batch_state
+    implicit none
+
+    ! Constants
+    ! real(8), parameter :: G = 6.674e-11  ! Gravitational constant in m³/(kg·s²)
+    real(8), parameter :: G = 1.0d0
+    real(8), parameter :: SOFTENING = 1.0d-4
+
+    ! Track initialization state
+    logical :: nbody_initialized = .false.
+
+    ! Public interfaces
+    public :: init_nbody
+    public :: cleanup_nbody
+    public :: calculate_forces_tensor
+    public :: leapfrog_step
+
+contains
+    subroutine init_nbody() bind(c, name='init_nbody')
+        call initialize_cuda_resources()
+        nbody_initialized = .true.
+        print *, "N-body Tensor Core simulation initialized with CUDA streams"
+    end subroutine init_nbody
+
+    subroutine cleanup_nbody() bind(c, name='cleanup_nbody')
+        if (nbody_initialized) then
+            call finalize_cuda_resources()
+            nbody_initialized = .false.
+            print *, "N-body Tensor Core resources cleaned up"
+        end if
+    end subroutine cleanup_nbody
+
+    attributes(global) subroutine calculate_forces_direct(positions, masses, forces, num_particles, g_const, softening_sq)
+        real(8), device :: positions(:,:)
+        real(8), device :: masses(:)
+        real(8), device :: forces(:,:)
+        integer, value :: num_particles
+        real(8), value :: g_const
+        real(8), value :: softening_sq
+
+        ! Shared memory for particle data
+        real(8), shared :: shared_pos(256, 3)
+        real(8), shared :: shared_masses(256)
+
+        integer :: i, j, j_tile, tx
+        integer :: block_size, tile_size
+        real(8) :: r_x, r_y, r_z, r_sq, inv_r_cubed, f_mag
+        real(8) :: pos_i_x, pos_i_y, pos_i_z, mass_i
+        real(8) :: force_x, force_y, force_z
+        integer :: actual_tile_size
+
+        ! Get thread ID and block size
+        tx = threadIdx%x
+        block_size = blockDim%x
+        tile_size = block_size  ! Use block size as tile size
+
+        ! Global index for this thread
+        i = (blockIdx%x - 1) * block_size + tx
+
+        ! Initial forces to zero
+        force_x = 0.0d0
+        force_y = 0.0d0
+        force_z = 0.0d0
+
+        ! Only proceed for valid particles
+        if (i <= num_particles) then
+            ! Load position and mass for this particle
+            pos_i_x = positions(i, 1)
+            pos_i_y = positions(i, 2)
+            pos_i_z = positions(i, 3)
+            mass_i = masses(i)
+
+            ! Process all tiles
+            do j_tile = 1, num_particles, tile_size
+                ! CRITICAL: Calculate actual tile size (may be smaller for last tile)
+
+                actual_tile_size = min(tile_size, num_particles - j_tile + 1)
+
+                ! Load particles into shared memory
+                if (tx <= actual_tile_size) then
+                    shared_pos(tx, 1) = positions(j_tile + tx - 1, 1)
+                    shared_pos(tx, 2) = positions(j_tile + tx - 1, 2)
+                    shared_pos(tx, 3) = positions(j_tile + tx - 1, 3)
+                    shared_masses(tx) = masses(j_tile + tx - 1)
+                endif
+
+                call syncthreads()
+
+                ! Process this tile
+                do j = 1, actual_tile_size
+                    ! Skip self-interaction
+                    if (i /= (j_tile + j - 1)) then
+                        ! Calculate displacement vector
+                        r_x = shared_pos(j, 1) - pos_i_x
+                        r_y = shared_pos(j, 2) - pos_i_y
+                        r_z = shared_pos(j, 3) - pos_i_z
+
+                        ! Calculate distance squared with softening
+                        r_sq = r_x**2 + r_y**2 + r_z**2 + softening_sq
+
+                        ! Calculate gravitational force
+                        ! inv_r_cubed = 1.0d0 / (r_sq * sqrt(r_sq))
+                        ! f_mag = g_const * mass_i * shared_masses(j) * inv_r_cubed
+                        ! use standard gravitational force formula:
+                        f_mag = g_const * mass_i * shared_masses(j) / r_sq
+
+                        ! Attractive force is opposite to displacement
+                        force_x = force_x + f_mag * r_x
+                        force_y = force_y + f_mag * r_y
+                        force_z = force_z + f_mag * r_z
+                    endif
+                end do
+
+                call syncthreads()
+            end do
+
+            ! Store final forces
+            forces(i, 1) = force_x
+            forces(i, 2) = force_y
+            forces(i, 3) = force_z
+        endif
+    end subroutine calculate_forces_direct
+
+    subroutine ensure_initialization()
+        if (.not. nbody_initialized) then
+            call debug_print("Resources not initialized, initializing now")
+            call init_nbody()
+        end if
+    end subroutine ensure_initialization
+
+    subroutine calculate_forces_tensor(positions, velocities, masses, forces, num_particles) &
+              bind(c, name='calculate_forces_tensor')
+        real(8), device :: positions(num_particles, 3)
+        real(8), device :: velocities(num_particles, 3)
+        real(8), device :: masses(num_particles)
+        real(8), device :: forces(num_particles, 3)
+        integer, value :: num_particles
+
+        integer :: stat, stream_index
+        type(dim3) :: grid, block
+        integer :: threads_per_block
+
+        forces = 0.0d0
+
+        call ensure_initialization()
+
+        stream_index = 1
+
+        ! Even smaller thread block size for safety
+        threads_per_block = 256
+
+        if (threads_per_block > num_particles) then
+            threads_per_block = num_particles
+        end if
+
+        block = dim3(threads_per_block, 1, 1)
+        grid = dim3(ceiling(real(num_particles) / real(threads_per_block)), 1, 1)
+
+        call cuda_error_check(cudaGetLastError(), "Pre-launch error check")
+
+        call calculate_forces_direct<<<grid, block, 0, resources(stream_index)%stream>>>( &
+            positions, masses, forces, num_particles, G, SOFTENING**2)
+
+        stat = cudaStreamSynchronize(resources(stream_index)%stream)
+        call cuda_error_check(stat, "Force calculation synchronization")
+    end subroutine calculate_forces_tensor
+
+    attributes(global) subroutine leapfrog_velocity_update(positions, velocities, forces, masses, dt, update_positions)
+        real(8), device :: positions(:,:)
+        real(8), device :: velocities(:,:)
+        real(8), device :: forces(:,:)
+        real(8), device :: masses(:)
+        real(8), value :: dt
+        integer, value :: update_positions
+
+        integer :: idx
+        real(8) :: half_dt, inv_mass, vel_x, vel_y, vel_z
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+
+        ! CRITICAL FIX: Bounds check before accessing arrays
+        if (idx <= size(masses)) then
+            inv_mass = 1.0d0 / masses(idx)
+            half_dt = 0.5d0 * dt
+
+            vel_x = velocities(idx, 1)
+            vel_y = velocities(idx, 2)
+            vel_z = velocities(idx, 3)
+
+            vel_x = vel_x + half_dt * forces(idx, 1) * inv_mass
+            vel_y = vel_y + half_dt * forces(idx, 2) * inv_mass
+            vel_z = vel_z + half_dt * forces(idx, 3) * inv_mass
+
+            velocities(idx, 1) = vel_x
+            velocities(idx, 2) = vel_y
+            velocities(idx, 3) = vel_z
+
+            if (update_positions == 1) then
+                positions(idx, 1) = positions(idx, 1) + dt * vel_x
+                positions(idx, 2) = positions(idx, 2) + dt * vel_y
+                positions(idx, 3) = positions(idx, 3) + dt * vel_z
+            end if
+        end if
+    end subroutine leapfrog_velocity_update
+
+    subroutine leapfrog_step(positions, velocities, masses, forces, num_particles, dt) &
+              bind(c, name='leapfrog_step')
+        real(8), device :: positions(num_particles, 3)
+        real(8), device :: velocities(num_particles, 3)
+        real(8), device :: masses(num_particles)
+        real(8), device :: forces(num_particles, 3)
+        integer, value :: num_particles
+        real(8), value :: dt
+
+        integer :: stat, stream_index
+        type(dim3) :: grid, block
+        integer :: threads_per_block
+
+        call ensure_initialization()
+
+        stream_index = 1
+
+        ! Even smaller thread block size for safety
+        threads_per_block = 128
+
+        if (threads_per_block > num_particles) then
+            threads_per_block = num_particles
+        end if
+
+        block = dim3(threads_per_block, 1, 1)
+        grid = dim3(ceiling(real(num_particles) / real(threads_per_block)), 1, 1)
+
+        call leapfrog_velocity_update<<<grid, block, 0, resources(stream_index)%stream>>>( &
+            positions, velocities, forces, masses, dt, 1)
+
+        stat = cudaStreamSynchronize(resources(stream_index)%stream)
+        call cuda_error_check(stat, "Velocity update synchronization")
+
+        call calculate_forces_tensor(positions, velocities, masses, forces, num_particles)
+
+        call leapfrog_velocity_update<<<grid, block, 0, resources(stream_index)%stream>>>( &
+            positions, velocities, forces, masses, dt, 0)
+
+        stat = cudaStreamSynchronize(resources(stream_index)%stream)
+        call cuda_error_check(stat, "Final leapfrog synchronization")
+    end subroutine leapfrog_step
+end module nbody_tensor
+! nvfortran -cuda -o3 -shared cuda_batch_state2.cuf cuda_matlib.cuf nbody_tensor6.cuf -o nbody_tensor6.so -lcublas -lcudart
+! correcting compute_forces_block (which is currently outputting 0s); calculate_forces_tensor_test needed to match the grid structure; now only 22Gflops?
+! using only shared memory for accuracy but block size 1024 for speed

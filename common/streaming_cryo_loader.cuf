@@ -1,0 +1,443 @@
+!================================================================
+! Streaming Cryo-EM Data Loader Module - v28f
+!================================================================
+! Specialized loader for Cryo-EM denoising with large 1024×1024 patches
+!
+! Key Features:
+!   - Reads paired noisy/clean patch files
+!   - Handles large patches (1024×1024 = 1,048,576 floats each)
+!   - Double-buffered streaming for GPU training
+!   - Memory-efficient batch loading
+!
+! File Format:
+!   - Binary files with float32 sample-major layout
+!   - Each patch: 1024×1024 contiguous floats
+!   - Noisy patches: train_input.bin / test_input.bin
+!   - Clean patches: train_target.bin / test_target.bin
+!
+! Usage:
+!   1. call cryo_loader_init(input_file, target_file, num_patches, batch_size)
+!   2. call cryo_loader_start_epoch()
+!   3. call cryo_loader_get_batch(batch_noisy, batch_clean, n)
+!   4. call cryo_loader_cleanup()
+!
+! Author: v28f Cryo-EM Team
+! Date: 2025-11-25
+!================================================================
+module streaming_cryo_loader
+    use cudafor
+    use omp_lib
+    implicit none
+
+    !----------------------------------------------------------------
+    ! Shuffle modes
+    !----------------------------------------------------------------
+    integer, parameter, public :: CRYO_SHUFFLE_NONE = 0
+    integer, parameter, public :: CRYO_SHUFFLE_BLOCK = 1
+    integer, parameter, public :: CRYO_SHUFFLE_FULL = 2
+
+    integer, parameter :: DEFAULT_BLOCK_SIZE = 50
+    integer, parameter :: PATCH_SIZE = 1024  ! 1024×1024 patches
+    integer, parameter :: PATCH_PIXELS = PATCH_SIZE * PATCH_SIZE  ! 1,048,576
+
+    !----------------------------------------------------------------
+    ! Double buffer structure
+    !----------------------------------------------------------------
+    type :: cryo_buffer_t
+        real(4), managed, allocatable :: noisy(:,:)   ! (PATCH_PIXELS, batch_size)
+        real(4), managed, allocatable :: clean(:,:)   ! (PATCH_PIXELS, batch_size)
+        integer :: batch_idx
+        logical :: ready
+    end type cryo_buffer_t
+
+    !----------------------------------------------------------------
+    ! Module state
+    !----------------------------------------------------------------
+    type(cryo_buffer_t), target, private :: buffer_a, buffer_b
+    type(cryo_buffer_t), pointer, private :: current_buffer => null()
+    type(cryo_buffer_t), pointer, private :: loading_buffer => null()
+
+    integer, private :: input_unit = 300
+    integer, private :: target_unit = 301
+    character(len=512), private :: input_filename
+    character(len=512), private :: target_filename
+
+    integer, private :: total_patches
+    integer, private :: batch_size
+    integer(8), private :: bytes_per_patch
+    integer(8), private :: bytes_per_batch
+    integer, private :: total_batches
+
+    integer, private :: current_batch_idx
+    integer, allocatable, private :: batch_order(:)
+
+    integer, private :: shuffle_mode = CRYO_SHUFFLE_BLOCK
+    integer, private :: block_size = DEFAULT_BLOCK_SIZE
+    logical, private :: is_initialized = .false.
+    logical, private :: files_open = .false.
+
+    public :: cryo_loader_init
+    public :: cryo_loader_start_epoch
+    public :: cryo_loader_get_batch
+    public :: cryo_loader_cleanup
+    public :: cryo_loader_set_shuffle
+    public :: cryo_loader_get_num_batches
+    public :: cryo_loader_is_ready
+
+contains
+
+    !================================================================
+    ! Initialize Cryo-EM streaming loader
+    !================================================================
+    subroutine cryo_loader_init(input_file, target_file, num_patches, batch_sz)
+        character(len=*), intent(in) :: input_file, target_file
+        integer, intent(in) :: num_patches, batch_sz
+
+        integer :: istat
+        logical :: input_exists, target_exists
+        integer(8) :: expected_size, actual_size
+
+        if (is_initialized) then
+            call cryo_loader_cleanup()
+        endif
+
+        ! Check files exist
+        inquire(file=input_file, exist=input_exists, size=actual_size)
+        inquire(file=target_file, exist=target_exists)
+
+        if (.not. input_exists) then
+            print *, ""
+            print *, "ERROR: Noisy input file not found!"
+            print *, "  Missing: ", trim(input_file)
+            stop 1
+        endif
+        if (.not. target_exists) then
+            print *, ""
+            print *, "ERROR: Clean target file not found!"
+            print *, "  Missing: ", trim(target_file)
+            stop 1
+        endif
+
+        ! Verify file size
+        expected_size = int(num_patches, 8) * int(PATCH_PIXELS, 8) * 4_8
+        if (actual_size /= expected_size) then
+            print *, ""
+            print *, "WARNING: File size mismatch!"
+            print '(A, I12)', "  Expected patches: ", num_patches
+            print '(A, F10.2, A)', "  Expected size:    ", real(expected_size) / (1024.0**3), " GB"
+            print '(A, F10.2, A)', "  Actual size:      ", real(actual_size) / (1024.0**3), " GB"
+            print '(A, I12)', "  Actual patches:   ", int(actual_size / (int(PATCH_PIXELS, 8) * 4_8))
+            print *, ""
+        endif
+
+        ! Store parameters
+        input_filename = input_file
+        target_filename = target_file
+        total_patches = num_patches
+        batch_size = batch_sz
+
+        ! Calculate sizes
+        bytes_per_patch = int(PATCH_PIXELS, 8) * 4_8  ! float32
+        bytes_per_batch = int(batch_sz, 8) * bytes_per_patch
+        total_batches = (num_patches + batch_sz - 1) / batch_sz
+
+        ! Allocate double buffers - (PATCH_PIXELS, batch_size)
+        allocate(buffer_a%noisy(PATCH_PIXELS, batch_sz), stat=istat)
+        allocate(buffer_a%clean(PATCH_PIXELS, batch_sz), stat=istat)
+        allocate(buffer_b%noisy(PATCH_PIXELS, batch_sz), stat=istat)
+        allocate(buffer_b%clean(PATCH_PIXELS, batch_sz), stat=istat)
+
+        if (istat /= 0) then
+            print *, "ERROR: Failed to allocate double buffers"
+            print *, "  Requested memory: ", real(4 * bytes_per_batch) / (1024.0**3), " GB"
+            stop 1
+        endif
+
+        buffer_a%ready = .false.
+        buffer_a%batch_idx = 0
+        buffer_b%ready = .false.
+        buffer_b%batch_idx = 0
+
+        allocate(batch_order(total_batches))
+
+        current_buffer => buffer_a
+        loading_buffer => buffer_b
+
+        is_initialized = .true.
+
+        print *, ""
+        print *, "=========================================="
+        print *, "  Cryo-EM Streaming Loader Initialized"
+        print *, "=========================================="
+        print '(A, A)', "  Noisy file:     ", trim(input_file)
+        print '(A, A)', "  Clean file:     ", trim(target_file)
+        print '(A, I12)', "  Total patches:  ", total_patches
+        print '(A, I5, A, I5)', "  Patch size:     ", PATCH_SIZE, " × ", PATCH_SIZE
+        print '(A, I12)', "  Pixels/patch:   ", PATCH_PIXELS
+        print '(A, I12)', "  Batch size:     ", batch_size
+        print '(A, I12)', "  Total batches:  ", total_batches
+        print '(A, F8.2, A)', "  Buffer memory:  ", &
+              real(4 * bytes_per_batch) / (1024.0**2), " MB"
+        print '(A, F8.2, A)', "  Per-batch data: ", &
+              real(2 * bytes_per_batch) / (1024.0**2), " MB"
+        print *, "=========================================="
+        print *, ""
+
+    end subroutine cryo_loader_init
+
+    !================================================================
+    ! Start new epoch with shuffling
+    !================================================================
+    subroutine cryo_loader_start_epoch()
+        integer :: i, j, temp, block_idx, num_blocks
+        real(4) :: r
+
+        if (.not. is_initialized) then
+            print *, "ERROR: Cryo-EM loader not initialized"
+            return
+        endif
+
+        ! Close files if open
+        if (files_open) then
+            close(input_unit)
+            close(target_unit)
+        endif
+
+        ! Open binary files for streaming
+        open(unit=input_unit, file=trim(input_filename), form='unformatted', &
+             access='stream', status='old')
+        open(unit=target_unit, file=trim(target_filename), form='unformatted', &
+             access='stream', status='old')
+        files_open = .true.
+
+        ! Initialize batch order (1, 2, 3, ...)
+        do i = 1, total_batches
+            batch_order(i) = i
+        end do
+
+        ! Shuffle based on mode
+        select case (shuffle_mode)
+        case (CRYO_SHUFFLE_NONE)
+            ! Sequential - no shuffling
+
+        case (CRYO_SHUFFLE_BLOCK)
+            ! Shuffle within blocks (memory-friendly)
+            num_blocks = (total_batches + block_size - 1) / block_size
+            do block_idx = num_blocks, 2, -1
+                call random_number(r)
+                j = 1 + int(r * real(block_idx))
+                ! Swap entire blocks
+                do i = 1, block_size
+                    if ((block_idx - 1) * block_size + i <= total_batches .and. &
+                        (j - 1) * block_size + i <= total_batches) then
+                        temp = batch_order((block_idx - 1) * block_size + i)
+                        batch_order((block_idx - 1) * block_size + i) = &
+                            batch_order((j - 1) * block_size + i)
+                        batch_order((j - 1) * block_size + i) = temp
+                    endif
+                end do
+            end do
+
+        case (CRYO_SHUFFLE_FULL)
+            ! Full Fisher-Yates shuffle
+            do i = total_batches, 2, -1
+                call random_number(r)
+                j = 1 + int(r * real(i))
+                temp = batch_order(i)
+                batch_order(i) = batch_order(j)
+                batch_order(j) = temp
+            end do
+        end select
+
+        ! Reset state
+        current_batch_idx = 0
+        current_buffer => buffer_a
+        loading_buffer => buffer_b
+        buffer_a%ready = .false.
+        buffer_b%ready = .false.
+
+        ! Pre-load first batch synchronously
+        call load_batch_sync(current_buffer, batch_order(1))
+        current_buffer%ready = .true.
+        current_batch_idx = 1
+
+        ! Start async load of second batch
+        if (total_batches > 1) then
+            call load_batch_sync(loading_buffer, batch_order(2))
+            loading_buffer%ready = .true.
+        endif
+
+    end subroutine cryo_loader_start_epoch
+
+    !================================================================
+    ! Get next batch (double-buffered)
+    !================================================================
+    subroutine cryo_loader_get_batch(batch_noisy, batch_clean, actual_size)
+        real(4), managed, intent(out) :: batch_noisy(:,:)
+        real(4), managed, intent(out) :: batch_clean(:,:)
+        integer, intent(out) :: actual_size
+
+        type(cryo_buffer_t), pointer :: temp_ptr
+        integer :: next_batch_idx
+
+        if (.not. is_initialized) then
+            print *, "ERROR: Cryo-EM loader not initialized"
+            actual_size = 0
+            return
+        endif
+
+        if (current_batch_idx > total_batches) then
+            actual_size = 0
+            return
+        endif
+
+        ! Wait for current buffer to be ready
+        do while (.not. current_buffer%ready)
+        end do
+
+        ! Calculate actual batch size (last batch may be partial)
+        if (current_batch_idx == total_batches) then
+            actual_size = mod(total_patches - 1, batch_size) + 1
+        else
+            actual_size = batch_size
+        endif
+
+        ! Copy data from buffer to output
+        batch_noisy(:, 1:actual_size) = current_buffer%noisy(:, 1:actual_size)
+        batch_clean(:, 1:actual_size) = current_buffer%clean(:, 1:actual_size)
+
+        ! Advance to next batch
+        current_batch_idx = current_batch_idx + 1
+
+        ! Swap buffers (current becomes loading, loading becomes current)
+        temp_ptr => current_buffer
+        current_buffer => loading_buffer
+        loading_buffer => temp_ptr
+        loading_buffer%ready = .false.
+
+        ! Start async load of next batch
+        next_batch_idx = current_batch_idx + 1
+        if (next_batch_idx <= total_batches) then
+            !$omp parallel sections num_threads(2)
+            !$omp section
+            ! Main thread continues
+            !$omp section
+            ! Background thread loads next batch
+            call load_batch_sync(loading_buffer, batch_order(next_batch_idx))
+            loading_buffer%ready = .true.
+            !$omp end parallel sections
+        endif
+
+    end subroutine cryo_loader_get_batch
+
+    !================================================================
+    ! Load batch synchronously (internal worker)
+    !================================================================
+    subroutine load_batch_sync(buf, batch_idx)
+        type(cryo_buffer_t), intent(inout) :: buf
+        integer, intent(in) :: batch_idx
+
+        integer(8) :: file_pos, samples_before
+        integer :: patches_in_batch
+        integer :: istat
+
+        ! Calculate file position
+        samples_before = int(batch_idx - 1, 8) * int(batch_size, 8)
+        if (samples_before + batch_size <= total_patches) then
+            patches_in_batch = batch_size
+        else
+            patches_in_batch = total_patches - int(samples_before)
+        endif
+
+        file_pos = samples_before * bytes_per_patch + 1_8
+
+        ! Initialize to zero
+        buf%noisy = 0.0
+        buf%clean = 0.0
+
+        ! Read noisy patches
+        read(input_unit, pos=file_pos, iostat=istat) buf%noisy(:, 1:patches_in_batch)
+        if (istat /= 0 .and. istat /= -1) then
+            print *, "WARNING: Error reading noisy batch", batch_idx, ", iostat=", istat
+        endif
+
+        ! Read clean patches
+        read(target_unit, pos=file_pos, iostat=istat) buf%clean(:, 1:patches_in_batch)
+        if (istat /= 0 .and. istat /= -1) then
+            print *, "WARNING: Error reading clean batch", batch_idx, ", iostat=", istat
+        endif
+
+        buf%batch_idx = batch_idx
+
+    end subroutine load_batch_sync
+
+    !================================================================
+    ! Set shuffle mode
+    !================================================================
+    subroutine cryo_loader_set_shuffle(mode, blk_size)
+        integer, intent(in) :: mode
+        integer, intent(in), optional :: blk_size
+
+        shuffle_mode = mode
+        if (present(blk_size)) then
+            block_size = blk_size
+        endif
+
+        select case (mode)
+        case (CRYO_SHUFFLE_NONE)
+            print *, "Shuffle mode: NONE (sequential)"
+        case (CRYO_SHUFFLE_BLOCK)
+            print *, "Shuffle mode: BLOCK (size=", block_size, ")"
+        case (CRYO_SHUFFLE_FULL)
+            print *, "Shuffle mode: FULL (Fisher-Yates)"
+        end select
+
+    end subroutine cryo_loader_set_shuffle
+
+    !================================================================
+    ! Get number of batches
+    !================================================================
+    function cryo_loader_get_num_batches() result(num)
+        integer :: num
+        num = total_batches
+    end function cryo_loader_get_num_batches
+
+    !================================================================
+    ! Check if initialized
+    !================================================================
+    function cryo_loader_is_ready() result(ready)
+        logical :: ready
+        ready = is_initialized
+    end function cryo_loader_is_ready
+
+    !================================================================
+    ! Cleanup and free resources
+    !================================================================
+    subroutine cryo_loader_cleanup()
+
+        if (.not. is_initialized) return
+
+        ! Close files
+        if (files_open) then
+            close(input_unit)
+            close(target_unit)
+            files_open = .false.
+        endif
+
+        ! Deallocate buffers
+        if (allocated(buffer_a%noisy)) deallocate(buffer_a%noisy)
+        if (allocated(buffer_a%clean)) deallocate(buffer_a%clean)
+        if (allocated(buffer_b%noisy)) deallocate(buffer_b%noisy)
+        if (allocated(buffer_b%clean)) deallocate(buffer_b%clean)
+        if (allocated(batch_order)) deallocate(batch_order)
+
+        nullify(current_buffer)
+        nullify(loading_buffer)
+
+        is_initialized = .false.
+
+        print *, "Cryo-EM streaming loader cleaned up"
+
+    end subroutine cryo_loader_cleanup
+
+end module streaming_cryo_loader

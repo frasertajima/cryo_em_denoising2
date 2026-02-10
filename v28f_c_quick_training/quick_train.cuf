@@ -1,0 +1,227 @@
+!================================================================
+! Quick Training Test
+!================================================================
+! Demonstrates full training loop with loss decrease
+!
+! Network: Conv(1→16) → ReLU → Conv(16→1)
+! Data: Synthetic noisy images (128×128)
+! Training: 1000 steps with Adam optimizer
+! Expected time: ~1 minute
+!================================================================
+program quick_train
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    ! cuDNN C interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    ! Training configuration
+    integer, parameter :: IMAGE_SIZE = 128
+    integer, parameter :: BATCH_SIZE = 4
+    integer, parameter :: NUM_STEPS = 1000
+    integer, parameter :: PRINT_EVERY = 50
+    real(4), parameter :: LEARNING_RATE = 0.0001  ! Lower LR for stability
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+    integer :: stat
+
+    ! Network layers
+    type(conv2d_layer_t) :: conv1, conv2
+
+    ! Device arrays
+    real(4), device, allocatable :: input(:,:,:,:)
+    real(4), device, allocatable :: target(:,:,:,:)
+    real(4), device, allocatable :: conv1_out(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+    real(4), device, allocatable :: grad_conv1(:,:,:,:)
+    real(4), device, allocatable :: grad_input(:,:,:,:)
+    real(4), device, allocatable :: temp_diff(:,:,:,:)
+
+    ! Host arrays
+    real(4), allocatable :: host_input(:,:,:,:)
+    real(4), allocatable :: host_target(:,:,:,:)
+    real(4), allocatable :: host_output(:,:,:,:)
+    real(4), allocatable :: host_diff(:,:,:,:)
+
+    ! Training metrics
+    real(4) :: loss
+    integer :: step
+    real(8) :: start_time, end_time, step_time
+
+    print *, ""
+    print *, "======================================================================="
+    print *, "  Quick Training Test - Denoising Demo"
+    print *, "======================================================================="
+    print *, ""
+    print *, "Configuration:"
+    print *, "  Network: Conv(1→16, 3×3) → ReLU → Conv(16→1, 3×3)"
+    print *, "  Image size:", IMAGE_SIZE, "×", IMAGE_SIZE
+    print *, "  Batch size:", BATCH_SIZE
+    print *, "  Training steps:", NUM_STEPS
+    print *, "  Learning rate:", LEARNING_RATE
+    print *, ""
+
+    ! Initialize cuDNN
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) stop "cuDNN init failed"
+
+    ! Initialize network
+    call conv2d_init(conv1, cudnn_handle, 1, 16, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.true.)
+    call conv2d_init(conv2, cudnn_handle, 16, 1, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    print *, "✓ Network initialized"
+    print *, ""
+
+    ! Allocate arrays
+    allocate(input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv1_out(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_conv1(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(temp_diff(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(host_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_diff(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    ! Load training data
+    call load_training_data()
+
+    print *, "✓ Data loaded"
+    print *, ""
+
+    ! Training loop
+    print *, "======================================================================="
+    print *, "  Training Progress"
+    print *, "======================================================================="
+    print *, ""
+    print '(A10, A15, A15)', "Step", "Loss", "Time (ms)"
+    print *, "-----------------------------------------------------------------------"
+
+    call cpu_time(start_time)
+
+    do step = 1, NUM_STEPS
+        call cpu_time(step_time)
+
+        ! Forward pass
+        call conv2d_forward(conv1, input, conv1_out)
+        call conv2d_forward(conv2, conv1_out, output)
+
+        ! Compute loss and gradient (on host to avoid device self-reference)
+        host_output = output
+        host_diff = host_output - host_target
+        loss = sum(host_diff**2) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+        host_diff = 2.0 * host_diff / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+        grad_output = host_diff
+
+        ! Backward pass
+        call conv2d_backward(conv2, conv1_out, output, grad_output, grad_conv1, compute_grad_input=.true.)
+        call conv2d_backward(conv1, input, conv1_out, grad_conv1, grad_input, compute_grad_input=.false.)
+
+        ! Update weights with Adam
+        call conv2d_update(conv1, LEARNING_RATE, step)
+        call conv2d_update(conv2, LEARNING_RATE, step)
+
+        ! Print progress
+        if (mod(step, PRINT_EVERY) == 0 .or. step == 1) then
+            call cpu_time(end_time)
+            print '(I10, ES15.6, F15.2)', step, loss, (end_time - step_time) * 1000.0
+        end if
+    end do
+
+    call cpu_time(end_time)
+
+    print *, "-----------------------------------------------------------------------"
+    print *, ""
+    print *, "======================================================================="
+    print *, "  Training Complete!"
+    print *, "======================================================================="
+    print *, ""
+    print '(A, F10.2, A)', "Total time: ", (end_time - start_time), " seconds"
+    print '(A, F10.2, A)', "Time per step: ", (end_time - start_time) / NUM_STEPS * 1000.0, " ms"
+    print *, ""
+
+    ! Final loss check
+    call conv2d_forward(conv1, input, conv1_out)
+    call conv2d_forward(conv2, conv1_out, output)
+    host_output = output
+    loss = sum((host_output - host_target)**2) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+
+    print '(A, ES12.4)', "Final loss: ", loss
+    print *, ""
+
+    if (loss < 0.1) then
+        print *, "✓ SUCCESS: Network learned to denoise (loss < 0.1)"
+    else
+        print *, "⚠ Loss still high - may need more steps or different data"
+    end if
+    print *, ""
+
+    ! Cleanup
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+
+contains
+
+    subroutine load_training_data()
+        ! Load synthetic noisy data for denoising
+        ! Input: noisy images, Target: clean images
+
+        integer :: i, j, k, b
+        character(len=256) :: filename
+        logical :: file_exists
+
+        ! Check if pre-generated data exists
+        inquire(file='data/train_input.bin', exist=file_exists)
+
+        if (file_exists) then
+            ! Load from file
+            open(unit=100, file='data/train_input.bin', form='unformatted', access='stream', status='old')
+            read(100) host_input
+            close(100)
+
+            open(unit=100, file='data/train_target.bin', form='unformatted', access='stream', status='old')
+            read(100) host_target
+            close(100)
+
+            print *, "  Loaded data from data/ directory"
+        else
+            ! Generate synthetic data on the fly
+            print *, "  Generating synthetic noisy data..."
+
+            ! Create clean images (target) - simple patterns
+            do b = 1, BATCH_SIZE
+                do j = 1, IMAGE_SIZE
+                    do i = 1, IMAGE_SIZE
+                        ! Checkerboard + gradients
+                        host_target(1, i, j, b) = &
+                            0.5 * sin(real(i) * 0.1) * cos(real(j) * 0.1) + &
+                            0.3 * real(mod(i/16 + j/16, 2))
+                    end do
+                end do
+            end do
+
+            ! Create noisy input by adding noise
+            call random_number(host_input)
+            host_input = host_target + 0.3 * (host_input - 0.5)
+        end if
+
+        ! Copy to device
+        input = host_input
+        target = host_target
+    end subroutine
+
+end program quick_train

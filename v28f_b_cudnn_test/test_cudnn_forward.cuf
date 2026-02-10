@@ -1,0 +1,315 @@
+!================================================================
+! Test cuDNN Forward Pass Against PyTorch Reference
+!================================================================
+! This program:
+!   1. Loads PyTorch weights from binary files
+!   2. Loads test batch (2 images, 1024×1024)
+!   3. Runs forward pass using cuDNN
+!   4. Compares output with PyTorch reference
+!   5. Reports numerical differences
+!
+! Success criteria:
+!   - Output matches PyTorch within 1e-5 tolerance
+!   - Loss matches PyTorch: 0.328323 ± 1e-6
+!
+! Author: v28f-b cuDNN Test Team
+! Date: 2025-11-25
+!================================================================
+program test_cudnn_forward
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    implicit none
+
+    ! cuDNN interface
+    interface
+        integer function cudnnCreate(handle) bind(C, name="cudnnCreate")
+            use iso_c_binding
+            type(c_ptr) :: handle
+        end function cudnnCreate
+    end interface
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+    integer :: cudnn_status
+
+    ! Model layers
+    type(conv2d_layer_t) :: conv1, conv2, conv3
+
+    ! Test batch parameters
+    integer, parameter :: BATCH_SIZE = 2
+    integer, parameter :: IMAGE_SIZE = 1024
+    integer, parameter :: CHANNELS_1 = 16
+
+    ! Data arrays
+    real(4), device, allocatable :: input(:,:,:,:)      ! (1, 1024, 1024, 2)
+    real(4), device, allocatable :: target(:,:,:,:)     ! (1, 1024, 1024, 2)
+    real(4), device, allocatable :: conv1_out(:,:,:,:)  ! (16, 1024, 1024, 2)
+    real(4), device, allocatable :: conv2_out(:,:,:,:)  ! (16, 1024, 1024, 2)
+    real(4), device, allocatable :: output(:,:,:,:)     ! (1, 1024, 1024, 2)
+
+    ! Reference output from PyTorch
+    real(4), device, allocatable :: pytorch_output(:,:,:,:)
+
+    ! Host arrays for loading
+    real(4), allocatable :: host_input(:,:,:,:)
+    real(4), allocatable :: host_target(:,:,:,:)
+    real(4), allocatable :: host_pytorch_out(:,:,:,:)
+
+    ! Statistics
+    real(4) :: loss, pytorch_loss
+    real(4) :: max_diff, mean_diff
+    integer :: istat
+
+    print *, ""
+    print *, "========================================"
+    print *, "  cuDNN Forward Pass Validation"
+    print *, "========================================"
+    print *, ""
+
+    ! Initialize cuDNN
+    cudnn_status = cudnnCreate(cudnn_handle)
+    if (cudnn_status /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "✓ cuDNN initialized"
+    print *, ""
+
+    ! Initialize conv layers
+    print *, "Initializing layers..."
+
+    ! Conv1: 1 -> 16 channels
+    call conv2d_init(conv1, cudnn_handle, &
+                    1, CHANNELS_1, 3, 1, 1, BATCH_SIZE, &
+                    IMAGE_SIZE, IMAGE_SIZE, .true.)
+    print *, "  ✓ Conv1: 1 -> 16 channels (3×3, ReLU)"
+
+    ! Conv2: 16 -> 16 channels
+    call conv2d_init(conv2, cudnn_handle, &
+                    CHANNELS_1, CHANNELS_1, 3, 1, 1, BATCH_SIZE, &
+                    IMAGE_SIZE, IMAGE_SIZE, .true.)
+    print *, "  ✓ Conv2: 16 -> 16 channels (3×3, ReLU)"
+
+    ! Conv3: 16 -> 1 channel
+    call conv2d_init(conv3, cudnn_handle, &
+                    CHANNELS_1, 1, 3, 1, 1, BATCH_SIZE, &
+                    IMAGE_SIZE, IMAGE_SIZE, .false.)
+    print *, "  ✓ Conv3: 16 -> 1 channel (3×3, linear)"
+    print *, ""
+
+    ! Allocate arrays
+    print *, "Allocating arrays..."
+    allocate(input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv1_out(CHANNELS_1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv2_out(CHANNELS_1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(pytorch_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(host_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_pytorch_out(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    print *, "  ✓ Allocated device and host arrays"
+    print *, ""
+
+    ! Load PyTorch weights
+    print *, "Loading PyTorch weights..."
+    call load_pytorch_weights(conv1, "../pytorch_reference/fortran_validation/conv1")
+    call load_pytorch_weights(conv2, "../pytorch_reference/fortran_validation/conv2")
+    call load_pytorch_weights(conv3, "../pytorch_reference/fortran_validation/conv3")
+    print *, "  ✓ Loaded all weights"
+    print *, ""
+
+    ! Load test batch
+    print *, "Loading test batch..."
+    call load_test_data("../pytorch_reference/fortran_validation/test_noisy.bin", host_input)
+    call load_test_data("../pytorch_reference/fortran_validation/test_clean.bin", host_target)
+    call load_test_data("../pytorch_reference/fortran_validation/test_output.bin", host_pytorch_out)
+
+    ! Copy to device
+    input = host_input
+    target = host_target
+    pytorch_output = host_pytorch_out
+    print *, "  ✓ Loaded test batch (2 × 1024×1024)"
+    print *, ""
+
+    ! Run forward pass
+    print *, "Running forward pass..."
+    call conv2d_forward(conv1, input, conv1_out)
+    call conv2d_forward(conv2, conv1_out, conv2_out)
+    call conv2d_forward(conv3, conv2_out, output)
+    print *, "  ✓ Forward pass complete"
+    print *, ""
+
+    ! Compute loss
+    print *, "Computing Fortran loss..."
+    loss = compute_mse_loss(output, target, BATCH_SIZE)
+    print '(A, F12.8)', "  Fortran loss = ", loss
+
+    print *, "Computing PyTorch loss..."
+    pytorch_loss = compute_mse_loss(pytorch_output, target, BATCH_SIZE)
+    print '(A, F12.8)', "  PyTorch loss = ", pytorch_loss
+
+    print *, "Comparing outputs..."
+    call compare_outputs(output, pytorch_output, max_diff, mean_diff)
+    print *, "  Done"
+
+    ! Report results
+    print *, "========================================"
+    print *, "  Results"
+    print *, "========================================"
+    print *, ""
+    print '(A, F12.8)', "Fortran Loss:  ", loss
+    print '(A, F12.8)', "PyTorch Loss:  ", pytorch_loss
+    print '(A, F12.8)', "Loss Diff:     ", abs(loss - pytorch_loss)
+    print *, ""
+    print '(A, E12.5)', "Max Output Diff:  ", max_diff
+    print '(A, E12.5)', "Mean Output Diff: ", mean_diff
+    print *, ""
+
+    ! Check tolerance
+    if (abs(loss - pytorch_loss) < 1.0e-6) then
+        print *, "✓ PASS: Loss matches PyTorch!"
+    else
+        print *, "✗ FAIL: Loss difference too large"
+    endif
+
+    if (max_diff < 1.0e-5) then
+        print *, "✓ PASS: Output matches PyTorch!"
+    else
+        print *, "✗ FAIL: Output difference too large"
+    endif
+    print *, ""
+
+    ! Cleanup
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+    call conv2d_cleanup(conv3)
+
+    deallocate(input, target, conv1_out, conv2_out, output, pytorch_output)
+    deallocate(host_input, host_target, host_pytorch_out)
+
+contains
+
+    !================================================================
+    ! Load PyTorch weights from binary files
+    !================================================================
+    subroutine load_pytorch_weights(layer, prefix)
+        type(conv2d_layer_t), intent(inout) :: layer
+        character(len=*), intent(in) :: prefix
+
+        character(len=512) :: weight_file, bias_file
+        real(4), allocatable :: weight(:), bias(:)
+        integer :: weight_size, bias_size
+
+        ! Construct filenames
+        weight_file = trim(prefix) // "_weight.bin"
+        bias_file = trim(prefix) // "_bias.bin"
+
+        ! Get sizes
+        weight_size = size(layer%weights)
+        bias_size = size(layer%bias)
+
+        ! Allocate temporary arrays
+        allocate(weight(weight_size))
+        allocate(bias(bias_size))
+
+        ! Read from files
+        open(unit=100, file=trim(weight_file), form='unformatted', &
+             access='stream', status='old')
+        read(100) weight
+        close(100)
+
+        open(unit=100, file=trim(bias_file), form='unformatted', &
+             access='stream', status='old')
+        read(100) bias
+        close(100)
+
+        ! Copy to device (reshape from 1D to 4D for weights)
+        layer%weights = reshape(weight, shape(layer%weights))
+        layer%bias = bias
+
+        deallocate(weight, bias)
+
+        print '(A, A)', "    Loaded: ", trim(prefix)
+
+    end subroutine load_pytorch_weights
+
+    !================================================================
+    ! Load test data from binary file
+    !================================================================
+    subroutine load_test_data(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(:,:,:,:)
+
+        open(unit=100, file=trim(filename), form='unformatted', &
+             access='stream', status='old')
+        read(100) array
+        close(100)
+
+    end subroutine load_test_data
+
+    !================================================================
+    ! Compute MSE loss
+    !================================================================
+    function compute_mse_loss(pred, target, batch_size) result(loss)
+        real(4), device, intent(in) :: pred(:,:,:,:), target(:,:,:,:)
+        integer, intent(in) :: batch_size
+        real(4) :: loss
+
+        real(4) :: sum_sq, pred_val, targ_val, diff_val
+        integer :: n, j, k, b
+
+        ! Compute MSE by accumulating on host (slow but reliable)
+        ! Use temporary scalars to avoid device-resident object issues
+        sum_sq = 0.0
+        do b = 1, batch_size
+            do k = 1, IMAGE_SIZE
+                do j = 1, IMAGE_SIZE
+                    pred_val = pred(1, j, k, b)
+                    targ_val = target(1, j, k, b)
+                    diff_val = pred_val - targ_val
+                    sum_sq = sum_sq + diff_val * diff_val
+                end do
+            end do
+        end do
+
+        n = IMAGE_SIZE * IMAGE_SIZE * batch_size
+        loss = sum_sq / real(n)
+
+    end function compute_mse_loss
+
+    !================================================================
+    ! Compare outputs element-wise
+    !================================================================
+    subroutine compare_outputs(a, b, max_diff, mean_diff)
+        real(4), device, intent(in) :: a(:,:,:,:), b(:,:,:,:)
+        real(4), intent(out) :: max_diff, mean_diff
+
+        real(4) :: sum_diff, abs_diff, a_val, b_val, local_max
+        integer :: n, j, k, batch
+
+        ! Compute max and mean differences using CPU loops
+        max_diff = 0.0
+        sum_diff = 0.0
+        n = 0
+
+        do batch = 1, BATCH_SIZE
+            do k = 1, IMAGE_SIZE
+                do j = 1, IMAGE_SIZE
+                    a_val = a(1, j, k, batch)
+                    b_val = b(1, j, k, batch)
+                    abs_diff = abs(a_val - b_val)
+                    if (abs_diff > max_diff) max_diff = abs_diff
+                    sum_diff = sum_diff + abs_diff
+                    n = n + 1
+                end do
+            end do
+        end do
+
+        mean_diff = sum_diff / real(n)
+
+    end subroutine compare_outputs
+
+end program test_cudnn_forward

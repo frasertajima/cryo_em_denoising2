@@ -1,0 +1,79 @@
+!================================================================
+! Command Line Arguments Module - v28d
+!================================================================
+! Simple command-line argument parsing for training options.
+!
+! Usage in main program:
+!   use cmdline_args
+!   call parse_cmdline_args()
+!   if (use_streaming) then
+!       ! Use streaming mode
+!   endif
+!
+! Command line options:
+!   --stream    Enable streaming mode (for huge datasets)
+!   --help      Show help message
+!
+! Author: v28d Streaming Team
+! Date: 2025-11-21
+!================================================================
+module cmdline_args
+    implicit none
+
+    ! Global flags set by parse_cmdline_args
+    logical, public :: use_streaming = .false.
+    logical, public :: show_help = .false.
+
+    public :: parse_cmdline_args
+    public :: print_usage
+
+contains
+
+    !================================================================
+    ! Parse command line arguments
+    !================================================================
+    subroutine parse_cmdline_args()
+        integer :: i, num_args
+        character(len=256) :: arg
+
+        num_args = command_argument_count()
+
+        do i = 1, num_args
+            call get_command_argument(i, arg)
+
+            select case (trim(arg))
+            case ('--stream', '-s', '--streaming')
+                use_streaming = .true.
+
+            case ('--help', '-h')
+                show_help = .true.
+
+            case default
+                ! Ignore unknown arguments
+            end select
+        end do
+
+    end subroutine parse_cmdline_args
+
+    !================================================================
+    ! Print usage information
+    !================================================================
+    subroutine print_usage(program_name)
+        character(len=*), intent(in) :: program_name
+
+        print *, ""
+        print *, "Usage: ", trim(program_name), " [options]"
+        print *, ""
+        print *, "Options:"
+        print *, "  --stream, -s   Enable streaming mode (for huge datasets)"
+        print *, "                 Memory usage stays constant regardless of dataset size"
+        print *, "  --help, -h     Show this help message"
+        print *, ""
+        print *, "Examples:"
+        print *, "  ./", trim(program_name), "              # Full RAM mode (default)"
+        print *, "  ./", trim(program_name), " --stream     # Streaming mode"
+        print *, ""
+
+    end subroutine print_usage
+
+end module cmdline_args

@@ -1,0 +1,509 @@
+!================================================================
+! cuDNN Backward Pass Validation Test
+!================================================================
+! Tests:
+!   1. Forward pass (already validated)
+!   2. Backward pass through conv layers
+!   3. Weight gradients
+!   4. Bias gradients
+!   5. Input gradients
+!
+! Compares all gradients against PyTorch exported values
+!================================================================
+program test_cudnn_backward
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    ! cuDNN C interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    ! Parameters
+    integer, parameter :: IMAGE_SIZE = 1024
+    integer, parameter :: BATCH_SIZE = 2
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+    integer :: stat
+
+    ! Layers
+    type(conv2d_layer_t) :: conv1, conv2, conv3
+
+    ! Device arrays for forward pass
+    real(4), device, allocatable :: input(:,:,:,:)
+    real(4), device, allocatable :: target(:,:,:,:)
+    real(4), device, allocatable :: conv1_out(:,:,:,:)
+    real(4), device, allocatable :: conv2_out(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+
+    ! Device arrays for backward pass
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+    real(4), device, allocatable :: grad_conv2(:,:,:,:)
+    real(4), device, allocatable :: grad_conv1(:,:,:,:)
+    real(4), device, allocatable :: grad_input(:,:,:,:)
+
+    ! Host arrays for loading/comparing
+    real(4), allocatable :: host_input(:,:,:,:)
+    real(4), allocatable :: host_target(:,:,:,:)
+
+    ! PyTorch exported gradients for comparison
+    real(4), allocatable :: pytorch_grad_conv1_w(:,:,:,:)
+    real(4), allocatable :: pytorch_grad_conv1_b(:)
+    real(4), allocatable :: pytorch_grad_conv2_w(:,:,:,:)
+    real(4), allocatable :: pytorch_grad_conv2_b(:)
+    real(4), allocatable :: pytorch_grad_conv3_w(:,:,:,:)
+    real(4), allocatable :: pytorch_grad_conv3_b(:)
+
+    ! Metrics
+    real(4) :: max_diff, mean_diff
+    real(4) :: loss
+
+    print *, ""
+    print *, "========================================"
+    print *, "  cuDNN Backward Pass Validation"
+    print *, "========================================"
+    print *, ""
+
+    ! Initialize cuDNN
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) stop "cuDNN init failed"
+    print *, "✓ cuDNN initialized"
+    print *, ""
+
+    ! Initialize layers (same as forward test)
+    print *, "Initializing layers..."
+    call conv2d_init(conv1, cudnn_handle, 1, 16, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.true.)
+    print *, "  ✓ Conv1: 1 -> 16 channels (3×3, ReLU)"
+
+    call conv2d_init(conv2, cudnn_handle, 16, 16, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.true.)
+    print *, "  ✓ Conv2: 16 -> 16 channels (3×3, ReLU)"
+
+    call conv2d_init(conv3, cudnn_handle, 16, 1, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+    print *, "  ✓ Conv3: 16 -> 1 channel (3×3, linear)"
+    print *, ""
+
+    ! Allocate arrays
+    print *, "Allocating arrays..."
+    allocate(input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv1_out(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(conv2_out(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(grad_output(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_conv2(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_conv1(16, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(grad_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(host_input(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_target(1, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    ! Allocate PyTorch gradient arrays
+    allocate(pytorch_grad_conv1_w(3, 3, 1, 16))
+    allocate(pytorch_grad_conv1_b(16))
+    allocate(pytorch_grad_conv2_w(3, 3, 16, 16))
+    allocate(pytorch_grad_conv2_b(16))
+    allocate(pytorch_grad_conv3_w(3, 3, 16, 1))
+    allocate(pytorch_grad_conv3_b(1))
+
+    print *, "  ✓ Allocated device and host arrays"
+    print *, ""
+
+    ! Load PyTorch weights
+    print *, "Loading PyTorch weights..."
+    call load_pytorch_weights(conv1, "../pytorch_reference/fortran_validation/conv1")
+    call load_pytorch_weights(conv2, "../pytorch_reference/fortran_validation/conv2")
+    call load_pytorch_weights(conv3, "../pytorch_reference/fortran_validation/conv3")
+    print *, "  ✓ Loaded all weights"
+    print *, ""
+
+    ! Load test batch
+    print *, "Loading test batch..."
+    call load_test_data("../pytorch_reference/fortran_validation/test_noisy.bin", host_input)
+    call load_test_data("../pytorch_reference/fortran_validation/test_clean.bin", host_target)
+    input = host_input
+    target = host_target
+    print *, "  ✓ Loaded test batch (2 × 1024×1024)"
+    print *, ""
+
+    ! Load PyTorch gradients
+    print *, "Loading PyTorch gradients..."
+    call load_gradient_4d("../pytorch_reference/fortran_validation/conv1_weight_grad.bin", pytorch_grad_conv1_w)
+    call load_gradient_1d("../pytorch_reference/fortran_validation/conv1_bias_grad.bin", pytorch_grad_conv1_b)
+    call load_gradient_4d("../pytorch_reference/fortran_validation/conv2_weight_grad.bin", pytorch_grad_conv2_w)
+    call load_gradient_1d("../pytorch_reference/fortran_validation/conv2_bias_grad.bin", pytorch_grad_conv2_b)
+    call load_gradient_4d("../pytorch_reference/fortran_validation/conv3_weight_grad.bin", pytorch_grad_conv3_w)
+    call load_gradient_1d("../pytorch_reference/fortran_validation/conv3_bias_grad.bin", pytorch_grad_conv3_b)
+    print *, "  ✓ Loaded PyTorch gradients"
+    print *, ""
+
+    ! Forward pass
+    print *, "Running forward pass..."
+    call conv2d_forward(conv1, input, conv1_out)
+    call conv2d_forward(conv2, conv1_out, conv2_out)
+    call conv2d_forward(conv3, conv2_out, output)
+    print *, "  ✓ Forward pass complete"
+    print *, ""
+
+    ! Compute initial gradient (dL/dOutput = 2 * (output - target) / N)
+    print *, "Computing loss gradient..."
+    call compute_mse_gradient(output, target, grad_output, BATCH_SIZE)
+    print *, "  ✓ Loss gradient computed"
+    print *, ""
+
+    ! Backward pass
+    print *, "Running backward pass..."
+    call conv2d_backward(conv3, conv2_out, output, grad_output, grad_conv2, compute_grad_input=.true.)
+    print *, "  ✓ Conv3 backward"
+
+    call conv2d_backward(conv2, conv1_out, conv2_out, grad_conv2, grad_conv1, compute_grad_input=.true.)
+    print *, "  ✓ Conv2 backward"
+
+    call conv2d_backward(conv1, input, conv1_out, grad_conv1, grad_input, compute_grad_input=.false.)
+    print *, "  ✓ Conv1 backward"
+    print *, ""
+
+    ! Compare gradients
+    print *, "========================================"
+    print *, "  Gradient Comparison"
+    print *, "========================================"
+    print *, ""
+
+    ! Debug: Check Fortran gradient values
+    print *, "Debug: Conv1 Fortran grad_weights sample values:"
+    print *, "  Shape: ", shape(conv1%grad_weights)
+    block
+        real(4), allocatable :: temp(:,:,:,:)
+        allocate(temp, mold=pytorch_grad_conv1_w)
+        temp = conv1%grad_weights
+        print *, "  grad(1,1,1,1) = ", temp(1,1,1,1)
+        print *, "  grad(2,1,1,1) = ", temp(2,1,1,1)
+        print *, "  Min/Max: ", minval(temp), maxval(temp)
+        deallocate(temp)
+    end block
+    print *, ""
+
+    ! Conv1 weight gradients
+    ! Note: Fortran grad_weights are in (Out,In,H,W), need to transform to (H,W,In,Out) for comparison
+    call compare_gradients_4d_transformed(conv1%grad_weights, pytorch_grad_conv1_w, max_diff, mean_diff, "Conv1 Weights")
+    print '(A, E12.5, A, E12.5)', "  Max diff: ", max_diff, "  Mean diff: ", mean_diff
+
+    ! Conv1 bias gradients
+    call compare_gradients_1d(conv1%grad_bias, pytorch_grad_conv1_b, max_diff, mean_diff, "Conv1 Bias")
+    print '(A, E12.5, A, E12.5)', "  Max diff: ", max_diff, "  Mean diff: ", mean_diff
+    print *, ""
+
+    ! Conv2 weight gradients
+    call compare_gradients_4d_transformed(conv2%grad_weights, pytorch_grad_conv2_w, max_diff, mean_diff, "Conv2 Weights")
+    print '(A, E12.5, A, E12.5)', "  Max diff: ", max_diff, "  Mean diff: ", mean_diff
+
+    ! Conv2 bias gradients
+    call compare_gradients_1d(conv2%grad_bias, pytorch_grad_conv2_b, max_diff, mean_diff, "Conv2 Bias")
+    print '(A, E12.5, A, E12.5)', "  Max diff: ", max_diff, "  Mean diff: ", mean_diff
+    print *, ""
+
+    ! Conv3 weight gradients
+    call compare_gradients_4d_transformed(conv3%grad_weights, pytorch_grad_conv3_w, max_diff, mean_diff, "Conv3 Weights")
+    print '(A, E12.5, A, E12.5)', "  Max diff: ", max_diff, "  Mean diff: ", mean_diff
+
+    ! Conv3 bias gradients
+    call compare_gradients_1d(conv3%grad_bias, pytorch_grad_conv3_b, max_diff, mean_diff, "Conv3 Bias")
+    print '(A, E12.5, A, E12.5)', "  Max diff: ", max_diff, "  Mean diff: ", mean_diff
+    print *, ""
+
+    print *, "========================================"
+    print *, "  Backward Pass Validation Complete!"
+    print *, "========================================"
+    print *, ""
+
+    ! Cleanup
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+    call conv2d_cleanup(conv3)
+
+    deallocate(input, target, conv1_out, conv2_out, output)
+    deallocate(grad_output, grad_conv2, grad_conv1, grad_input)
+    deallocate(host_input, host_target)
+    deallocate(pytorch_grad_conv1_w, pytorch_grad_conv1_b)
+    deallocate(pytorch_grad_conv2_w, pytorch_grad_conv2_b)
+    deallocate(pytorch_grad_conv3_w, pytorch_grad_conv3_b)
+
+contains
+
+    !================================================================
+    ! Load PyTorch weights
+    !================================================================
+    subroutine load_pytorch_weights(layer, prefix)
+        type(conv2d_layer_t), intent(inout) :: layer
+        character(len=*), intent(in) :: prefix
+
+        real(4), allocatable :: weight(:), bias(:)
+        character(len=256) :: weight_file, bias_file
+        integer :: weight_size, bias_size
+
+        ! Construct filenames
+        weight_file = trim(prefix) // "_weight.bin"
+        bias_file = trim(prefix) // "_bias.bin"
+
+        ! Get sizes
+        weight_size = size(layer%weights)
+        bias_size = size(layer%bias)
+
+        ! Allocate temporary arrays
+        allocate(weight(weight_size))
+        allocate(bias(bias_size))
+
+        ! Read from files
+        open(unit=100, file=trim(weight_file), form='unformatted', &
+             access='stream', status='old')
+        read(100) weight
+        close(100)
+
+        open(unit=100, file=trim(bias_file), form='unformatted', &
+             access='stream', status='old')
+        read(100) bias
+        close(100)
+
+        ! Copy to device
+        layer%weights = reshape(weight, shape(layer%weights))
+        layer%bias = bias
+
+        deallocate(weight, bias)
+
+        print '(A, A)', "    Loaded: ", trim(prefix)
+
+    end subroutine load_pytorch_weights
+
+    !================================================================
+    ! Load test data
+    !================================================================
+    subroutine load_test_data(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(:,:,:,:)
+
+        open(unit=100, file=trim(filename), form='unformatted', &
+             access='stream', status='old')
+        read(100) array
+        close(100)
+
+    end subroutine load_test_data
+
+    !================================================================
+    ! Load 4D gradient data
+    !================================================================
+    subroutine load_gradient_4d(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(:,:,:,:)
+
+        open(unit=100, file=trim(filename), form='unformatted', &
+             access='stream', status='old')
+        read(100) array
+        close(100)
+
+    end subroutine load_gradient_4d
+
+    !================================================================
+    ! Load 1D gradient data
+    !================================================================
+    subroutine load_gradient_1d(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(:)
+
+        open(unit=100, file=trim(filename), form='unformatted', &
+             access='stream', status='old')
+        read(100) array
+        close(100)
+
+    end subroutine load_gradient_1d
+
+    !================================================================
+    ! Compute MSE gradient
+    !================================================================
+    subroutine compute_mse_gradient(pred, target, grad, batch_size)
+        real(4), device, intent(in) :: pred(:,:,:,:), target(:,:,:,:)
+        real(4), device, intent(out) :: grad(:,:,:,:)
+        integer, intent(in) :: batch_size
+
+        real(4) :: scale
+        integer :: n
+
+        ! dL/dOutput = 2 * (pred - target) / N
+        n = IMAGE_SIZE * IMAGE_SIZE * batch_size
+        scale = 2.0 / real(n)
+
+        ! Use CUF kernel for GPU computation
+        !$cuf kernel do(3) <<<*,*>>>
+        do n = 1, batch_size
+            do k = 1, IMAGE_SIZE
+                do j = 1, IMAGE_SIZE
+                    grad(1, j, k, n) = scale * (pred(1, j, k, n) - target(1, j, k, n))
+                end do
+            end do
+        end do
+
+    end subroutine compute_mse_gradient
+
+    !================================================================
+    ! Compare 4D gradients with transformation
+    !================================================================
+    ! CRITICAL: cuDNN stores gradients in (Out, In, H, W) format
+    ! But our PyTorch export has them in (H, W, In, Out) format
+    ! So we need to transform Fortran gradients before comparing!
+    !
+    ! This is the SAME transformation applied to weights:
+    ! 1. Copy to host
+    ! 2. Flip spatial dimensions (H, W)
+    ! 3. Transpose (Out,In,H,W) -> (H,W,In,Out)
+    ! 4. Compare element-wise
+    !================================================================
+    subroutine compare_gradients_4d_transformed(fortran_grad, pytorch_grad, max_diff, mean_diff, name)
+        real(4), device, intent(in) :: fortran_grad(:,:,:,:)  ! (Out, In, H, W)
+        real(4), intent(in) :: pytorch_grad(:,:,:,:)          ! (H, W, In, Out)
+        real(4), intent(out) :: max_diff, mean_diff
+        character(len=*), intent(in) :: name
+
+        real(4), allocatable :: fortran_host(:,:,:,:)
+        real(4), allocatable :: fortran_transformed(:,:,:,:)
+        real(4) :: sum_diff, abs_diff
+        integer :: out_c, in_c, h, w
+        integer :: i, j, k, l, n
+
+        ! Get dimensions from Fortran gradient (Out, In, H, W)
+        out_c = size(fortran_grad, 1)
+        in_c = size(fortran_grad, 2)
+        h = size(fortran_grad, 3)
+        w = size(fortran_grad, 4)
+
+        ! Copy Fortran gradient to host
+        allocate(fortran_host(out_c, in_c, h, w))
+        fortran_host = fortran_grad
+
+        ! Allocate for transformed version (H, W, In, Out)
+        allocate(fortran_transformed(h, w, in_c, out_c))
+
+        ! Transform: flip spatial + transpose (Out,In,H,W) -> (H,W,In,Out)
+        ! Flip: H and W are reversed
+        do l = 1, out_c
+            do k = 1, in_c
+                do j = 1, w
+                    do i = 1, h
+                        ! Flip spatial: (h,w) -> (h_flip, w_flip)
+                        fortran_transformed(i, j, k, l) = fortran_host(l, k, h-i+1, w-j+1)
+                    end do
+                end do
+            end do
+        end do
+
+        ! Compute differences
+        max_diff = 0.0
+        sum_diff = 0.0
+        n = 0
+
+        do l = 1, out_c
+            do k = 1, in_c
+                do j = 1, w
+                    do i = 1, h
+                        abs_diff = abs(fortran_transformed(i,j,k,l) - pytorch_grad(i,j,k,l))
+                        if (abs_diff > max_diff) max_diff = abs_diff
+                        sum_diff = sum_diff + abs_diff
+                        n = n + 1
+                    end do
+                end do
+            end do
+        end do
+
+        mean_diff = sum_diff / real(n)
+
+        print '(A, A)', name, ":"
+
+        deallocate(fortran_host, fortran_transformed)
+
+    end subroutine compare_gradients_4d_transformed
+
+    !================================================================
+    ! Compare 4D gradients (direct, no transformation)
+    !================================================================
+    subroutine compare_gradients_4d(fortran_grad, pytorch_grad, max_diff, mean_diff, name)
+        real(4), device, intent(in) :: fortran_grad(:,:,:,:)
+        real(4), intent(in) :: pytorch_grad(:,:,:,:)
+        real(4), intent(out) :: max_diff, mean_diff
+        character(len=*), intent(in) :: name
+
+        real(4), allocatable :: fortran_host(:,:,:,:)
+        real(4) :: sum_diff, abs_diff
+        integer :: i, j, k, l, n
+
+        ! Copy Fortran gradient to host
+        allocate(fortran_host, mold=pytorch_grad)
+        fortran_host = fortran_grad
+
+        ! Compute differences
+        max_diff = 0.0
+        sum_diff = 0.0
+        n = 0
+
+        do l = 1, size(pytorch_grad, 4)
+            do k = 1, size(pytorch_grad, 3)
+                do j = 1, size(pytorch_grad, 2)
+                    do i = 1, size(pytorch_grad, 1)
+                        abs_diff = abs(fortran_host(i,j,k,l) - pytorch_grad(i,j,k,l))
+                        if (abs_diff > max_diff) max_diff = abs_diff
+                        sum_diff = sum_diff + abs_diff
+                        n = n + 1
+                    end do
+                end do
+            end do
+        end do
+
+        mean_diff = sum_diff / real(n)
+
+        print '(A, A)', name, ":"
+
+        deallocate(fortran_host)
+
+    end subroutine compare_gradients_4d
+
+    !================================================================
+    ! Compare 1D gradients
+    !================================================================
+    subroutine compare_gradients_1d(fortran_grad, pytorch_grad, max_diff, mean_diff, name)
+        real(4), device, intent(in) :: fortran_grad(:)
+        real(4), intent(in) :: pytorch_grad(:)
+        real(4), intent(out) :: max_diff, mean_diff
+        character(len=*), intent(in) :: name
+
+        real(4), allocatable :: fortran_host(:)
+        real(4) :: sum_diff, abs_diff
+        integer :: i, n
+
+        ! Copy Fortran gradient to host
+        allocate(fortran_host, mold=pytorch_grad)
+        fortran_host = fortran_grad
+
+        ! Compute differences
+        max_diff = 0.0
+        sum_diff = 0.0
+        n = size(pytorch_grad)
+
+        do i = 1, n
+            abs_diff = abs(fortran_host(i) - pytorch_grad(i))
+            if (abs_diff > max_diff) max_diff = abs_diff
+            sum_diff = sum_diff + abs_diff
+        end do
+
+        mean_diff = sum_diff / real(n)
+
+        print '(A, A)', name, ":"
+
+        deallocate(fortran_host)
+
+    end subroutine compare_gradients_1d
+
+end program test_cudnn_backward

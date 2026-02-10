@@ -1,0 +1,528 @@
+!================================================================
+! Cryo-EM U-Net Denoising Model
+!================================================================
+! U-Net architecture for cryo-EM image denoising.
+! Designed for 1024×1024 grayscale patches.
+!
+! Architecture:
+!   Encoder: 4 levels of downsampling (1024->512->256->128->64)
+!   Bottleneck: Deepest feature representation at 64×64
+!   Decoder: 4 levels of upsampling with skip connections
+!
+! Input:  (batch, 1, 1024, 1024)  - noisy cryo-EM patch
+! Output: (batch, 1, 1024, 1024)  - denoised patch
+!
+! Author: v28f Cryo-EM Team
+! Date: 2025-11-25
+!================================================================
+module cryo_unet_module
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    use pooling_cudnn
+    use unet_blocks
+    implicit none
+
+    !================================================================
+    ! U-Net Model Configuration
+    !================================================================
+    ! Cryo-EM data: 1 channel (grayscale), 1024×1024 spatial
+    ! Already power of 2, no padding needed
+    integer, parameter :: INPUT_CHANNELS = 1
+    integer, parameter :: IMAGE_HEIGHT = 1024
+    integer, parameter :: IMAGE_WIDTH = 1024
+
+    ! Channel progression: 1 -> 32 -> 64 -> 128 -> 256 (bottleneck) -> back down
+    ! 4 downsampling levels: 1024 -> 512 -> 256 -> 128 -> 64
+    integer, parameter :: ENC1_CHANNELS = 32
+    integer, parameter :: ENC2_CHANNELS = 64
+    integer, parameter :: ENC3_CHANNELS = 128
+    integer, parameter :: ENC4_CHANNELS = 256
+    integer, parameter :: BOTTLENECK_CHANNELS = 512
+
+    !================================================================
+    ! U-Net Model Type
+    !================================================================
+    type :: cryo_unet_t
+        ! Encoder blocks (4 levels for 1024×1024)
+        type(encoder_block_t) :: enc1    ! 1024×1024 -> 512×512
+        type(encoder_block_t) :: enc2    ! 512×512 -> 256×256
+        type(encoder_block_t) :: enc3    ! 256×256 -> 128×128
+        type(encoder_block_t) :: enc4    ! 128×128 -> 64×64
+
+        ! Bottleneck (two conv layers at 64×64)
+        type(conv2d_layer_t) :: bottleneck1
+        type(conv2d_layer_t) :: bottleneck2
+
+        ! Decoder blocks (4 levels)
+        type(decoder_block_t) :: dec4    ! 64×64 -> 128×128
+        type(decoder_block_t) :: dec3    ! 128×128 -> 256×256
+        type(decoder_block_t) :: dec2    ! 256×256 -> 512×512
+        type(decoder_block_t) :: dec1    ! 512×512 -> 1024×1024
+
+        ! Final 1x1 conv to get single output channel
+        type(conv2d_layer_t) :: final_conv
+
+        ! Skip connections storage (4 levels)
+        real(4), device, allocatable :: skip1(:,:,:,:)  ! 1024×1024
+        real(4), device, allocatable :: skip2(:,:,:,:)  ! 512×512
+        real(4), device, allocatable :: skip3(:,:,:,:)  ! 256×256
+        real(4), device, allocatable :: skip4(:,:,:,:)  ! 128×128
+
+        ! Intermediate outputs
+        real(4), device, allocatable :: enc1_out(:,:,:,:)
+        real(4), device, allocatable :: enc2_out(:,:,:,:)
+        real(4), device, allocatable :: enc3_out(:,:,:,:)
+        real(4), device, allocatable :: enc4_out(:,:,:,:)
+        real(4), device, allocatable :: bottleneck_out(:,:,:,:)
+        real(4), device, allocatable :: dec4_out(:,:,:,:)
+        real(4), device, allocatable :: dec3_out(:,:,:,:)
+        real(4), device, allocatable :: dec2_out(:,:,:,:)
+        real(4), device, allocatable :: dec1_out(:,:,:,:)
+
+        integer :: batch_size
+        type(c_ptr) :: cudnn_handle
+
+        logical :: initialized = .false.
+    end type climate_unet_t
+
+    public :: climate_unet_t
+    public :: unet_init, unet_forward, unet_backward, unet_update, unet_cleanup
+    public :: unet_get_num_parameters
+
+contains
+
+    !================================================================
+    ! Initialize U-Net Model
+    !================================================================
+    subroutine unet_init(model, handle, batch_size)
+        type(climate_unet_t), intent(inout) :: model
+        type(c_ptr), intent(in) :: handle
+        integer, intent(in) :: batch_size
+
+        model%cudnn_handle = handle
+        model%batch_size = batch_size
+
+        print *, ""
+        print *, "=============================================="
+        print *, "  Climate U-Net Model"
+        print *, "=============================================="
+        print '(A,I4,A,I4)', "  Input:  ", PADDED_HEIGHT, " x ", PADDED_WIDTH
+        print '(A,I4)', "  Channels: ", INPUT_CHANNELS
+        print '(A,I4)', "  Batch:    ", batch_size
+
+        ! Encoder 1: 6 -> 32, 256x128 -> 128x64
+        call encoder_init(model%enc1, handle, INPUT_CHANNELS, ENC1_CHANNELS, &
+                         batch_size, PADDED_HEIGHT, PADDED_WIDTH)
+        print *, "  Enc1: 6->32, 256x128->128x64"
+
+        ! Encoder 2: 32 -> 64, 128x64 -> 64x32
+        call encoder_init(model%enc2, handle, ENC1_CHANNELS, ENC2_CHANNELS, &
+                         batch_size, 128, 64)
+        print *, "  Enc2: 32->64, 128x64->64x32"
+
+        ! Encoder 3: 64 -> 128, 64x32 -> 32x16
+        call encoder_init(model%enc3, handle, ENC2_CHANNELS, ENC3_CHANNELS, &
+                         batch_size, 64, 32)
+        print *, "  Enc3: 64->128, 64x32->32x16"
+
+        ! Bottleneck: 128 -> 256, stays at 32x16
+        call conv2d_init(model%bottleneck1, handle, ENC3_CHANNELS, BOTTLENECK_CHANNELS, &
+                        3, 1, 1, batch_size, 32, 16, use_relu=.true.)
+        call conv2d_init(model%bottleneck2, handle, BOTTLENECK_CHANNELS, BOTTLENECK_CHANNELS, &
+                        3, 1, 1, batch_size, 32, 16, use_relu=.true.)
+        print *, "  Bottleneck: 128->256->256 at 32x16"
+
+        ! Decoder 3: 256 + 128 skip -> 128, 32x16 -> 64x32
+        call decoder_init(model%dec3, handle, BOTTLENECK_CHANNELS, ENC3_CHANNELS, ENC3_CHANNELS, &
+                         batch_size, 32, 16)
+        print *, "  Dec3: 256+128->128, 32x16->64x32"
+
+        ! Decoder 2: 128 + 64 skip -> 64, 64x32 -> 128x64
+        call decoder_init(model%dec2, handle, ENC3_CHANNELS, ENC2_CHANNELS, ENC2_CHANNELS, &
+                         batch_size, 64, 32)
+        print *, "  Dec2: 128+64->64, 64x32->128x64"
+
+        ! Decoder 1: 64 + 32 skip -> 32, 128x64 -> 256x128
+        call decoder_init(model%dec1, handle, ENC2_CHANNELS, ENC1_CHANNELS, ENC1_CHANNELS, &
+                         batch_size, 128, 64)
+        print *, "  Dec1: 64+32->32, 128x64->256x128"
+
+        ! Final 1x1 conv: 32 -> 6
+        call conv2d_init(model%final_conv, handle, ENC1_CHANNELS, INPUT_CHANNELS, &
+                        1, 0, 1, batch_size, PADDED_HEIGHT, PADDED_WIDTH, use_relu=.false.)
+        print *, "  Final: 32->6 (1x1 conv, no ReLU)"
+
+        ! Allocate skip connection storage
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(model%skip1(PADDED_WIDTH, PADDED_HEIGHT, ENC1_CHANNELS, batch_size))
+        allocate(model%skip2(64, 128, ENC2_CHANNELS, batch_size))
+        allocate(model%skip3(32, 64, ENC3_CHANNELS, batch_size))
+
+        ! Allocate intermediate outputs
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(model%enc1_out(64, 128, ENC1_CHANNELS, batch_size))
+        allocate(model%enc2_out(32, 64, ENC2_CHANNELS, batch_size))
+        allocate(model%enc3_out(16, 32, ENC3_CHANNELS, batch_size))
+        allocate(model%bottleneck_out(16, 32, BOTTLENECK_CHANNELS, batch_size))
+        allocate(model%dec3_out(32, 64, ENC3_CHANNELS, batch_size))
+        allocate(model%dec2_out(64, 128, ENC2_CHANNELS, batch_size))
+        allocate(model%dec1_out(PADDED_WIDTH, PADDED_HEIGHT, ENC1_CHANNELS, batch_size))
+
+        ! Allocate padding buffers
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(model%padded_input(PADDED_WIDTH, PADDED_HEIGHT, INPUT_CHANNELS, batch_size))
+        allocate(model%padded_output(PADDED_WIDTH, PADDED_HEIGHT, INPUT_CHANNELS, batch_size))
+
+        model%initialized = .true.
+
+        print *, "=============================================="
+        call unet_get_num_parameters(model)
+        print *, "=============================================="
+        print *, ""
+
+    end subroutine unet_init
+
+    !================================================================
+    ! Count Model Parameters
+    !================================================================
+    subroutine unet_get_num_parameters(model)
+        type(climate_unet_t), intent(in) :: model
+
+        integer(8) :: total_params
+        real(4) :: size_mb
+
+        total_params = 0
+
+        ! Encoder params (2 convs each: in->out + out->out)
+        ! Enc1: 6*32*9 + 32 + 32*32*9 + 32 = 1728 + 32 + 9216 + 32 = 11008
+        total_params = total_params + &
+            size(model%enc1%conv1%weights) + size(model%enc1%conv1%bias) + &
+            size(model%enc1%conv2%weights) + size(model%enc1%conv2%bias)
+
+        total_params = total_params + &
+            size(model%enc2%conv1%weights) + size(model%enc2%conv1%bias) + &
+            size(model%enc2%conv2%weights) + size(model%enc2%conv2%bias)
+
+        total_params = total_params + &
+            size(model%enc3%conv1%weights) + size(model%enc3%conv1%bias) + &
+            size(model%enc3%conv2%weights) + size(model%enc3%conv2%bias)
+
+        ! Bottleneck
+        total_params = total_params + &
+            size(model%bottleneck1%weights) + size(model%bottleneck1%bias) + &
+            size(model%bottleneck2%weights) + size(model%bottleneck2%bias)
+
+        ! Decoder params
+        total_params = total_params + &
+            size(model%dec3%conv1%weights) + size(model%dec3%conv1%bias) + &
+            size(model%dec3%conv2%weights) + size(model%dec3%conv2%bias)
+
+        total_params = total_params + &
+            size(model%dec2%conv1%weights) + size(model%dec2%conv1%bias) + &
+            size(model%dec2%conv2%weights) + size(model%dec2%conv2%bias)
+
+        total_params = total_params + &
+            size(model%dec1%conv1%weights) + size(model%dec1%conv1%bias) + &
+            size(model%dec1%conv2%weights) + size(model%dec1%conv2%bias)
+
+        ! Final conv
+        total_params = total_params + &
+            size(model%final_conv%weights) + size(model%final_conv%bias)
+
+        size_mb = real(total_params) * 4.0 / (1024.0 * 1024.0)
+
+        print '(A,I12)', "  Total parameters: ", total_params
+        print '(A,F10.2,A)', "  Model size:       ", size_mb, " MB"
+
+    end subroutine unet_get_num_parameters
+
+    !================================================================
+    ! Forward Pass
+    !================================================================
+    subroutine unet_forward(model, input, output)
+        type(climate_unet_t), intent(inout) :: model
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        real(4), device, intent(in) :: input(ORIGINAL_WIDTH, ORIGINAL_HEIGHT, &
+                                             INPUT_CHANNELS, model%batch_size)
+        real(4), device, intent(out) :: output(ORIGINAL_WIDTH, ORIGINAL_HEIGHT, &
+                                               INPUT_CHANNELS, model%batch_size)
+
+        real(4), device, allocatable :: bottleneck_temp(:,:,:,:)
+
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(bottleneck_temp(16, 32, BOTTLENECK_CHANNELS, model%batch_size))
+
+        ! Pad input from 240x121 to 256x128
+        call pad_input(input, model%padded_input, model%batch_size, INPUT_CHANNELS, &
+                      ORIGINAL_HEIGHT, ORIGINAL_WIDTH, PADDED_HEIGHT, PADDED_WIDTH)
+
+        ! Encoder path
+        call encoder_forward(model%enc1, model%padded_input, model%enc1_out, model%skip1)
+        call encoder_forward(model%enc2, model%enc1_out, model%enc2_out, model%skip2)
+        call encoder_forward(model%enc3, model%enc2_out, model%enc3_out, model%skip3)
+
+        ! Bottleneck
+        call conv2d_forward(model%bottleneck1, model%enc3_out, bottleneck_temp)
+        call conv2d_forward(model%bottleneck2, bottleneck_temp, model%bottleneck_out)
+
+        ! Decoder path
+        call decoder_forward(model%dec3, model%bottleneck_out, model%skip3, model%dec3_out)
+        call decoder_forward(model%dec2, model%dec3_out, model%skip2, model%dec2_out)
+        call decoder_forward(model%dec1, model%dec2_out, model%skip1, model%dec1_out)
+
+        ! Final 1x1 conv
+        call conv2d_forward(model%final_conv, model%dec1_out, model%padded_output)
+
+        ! Crop output from 256x128 to 240x121
+        call crop_output(model%padded_output, output, model%batch_size, INPUT_CHANNELS, &
+                        PADDED_HEIGHT, PADDED_WIDTH, ORIGINAL_HEIGHT, ORIGINAL_WIDTH)
+
+        deallocate(bottleneck_temp)
+
+    end subroutine unet_forward
+
+    !================================================================
+    ! Backward Pass - Full Backpropagation
+    !================================================================
+    subroutine unet_backward(model, input, output, grad_output)
+        type(climate_unet_t), intent(inout) :: model
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        real(4), device, intent(in) :: input(ORIGINAL_WIDTH, ORIGINAL_HEIGHT, &
+                                             INPUT_CHANNELS, model%batch_size)
+        real(4), device, intent(in) :: output(ORIGINAL_WIDTH, ORIGINAL_HEIGHT, &
+                                              INPUT_CHANNELS, model%batch_size)
+        real(4), device, intent(in) :: grad_output(ORIGINAL_WIDTH, ORIGINAL_HEIGHT, &
+                                                   INPUT_CHANNELS, model%batch_size)
+
+        ! Gradient buffers
+        real(4), device, allocatable :: grad_padded(:,:,:,:)
+        real(4), device, allocatable :: grad_dec1(:,:,:,:)
+        real(4), device, allocatable :: grad_dec2(:,:,:,:)
+        real(4), device, allocatable :: grad_dec3(:,:,:,:)
+        real(4), device, allocatable :: grad_bottleneck(:,:,:,:)
+        real(4), device, allocatable :: grad_bottleneck_temp(:,:,:,:)
+        real(4), device, allocatable :: grad_enc3(:,:,:,:)
+        real(4), device, allocatable :: grad_enc2(:,:,:,:)
+        real(4), device, allocatable :: grad_enc1(:,:,:,:)
+        real(4), device, allocatable :: grad_skip1(:,:,:,:)
+        real(4), device, allocatable :: grad_skip2(:,:,:,:)
+        real(4), device, allocatable :: grad_skip3(:,:,:,:)
+        real(4), device, allocatable :: grad_input_padded(:,:,:,:)
+
+        ! Allocate gradient buffers
+        ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+        allocate(grad_padded(PADDED_WIDTH, PADDED_HEIGHT, INPUT_CHANNELS, model%batch_size))
+        allocate(grad_dec1(PADDED_WIDTH, PADDED_HEIGHT, ENC1_CHANNELS, model%batch_size))
+        allocate(grad_dec2(64, 128, ENC2_CHANNELS, model%batch_size))
+        allocate(grad_dec3(32, 64, ENC3_CHANNELS, model%batch_size))
+        allocate(grad_bottleneck(16, 32, BOTTLENECK_CHANNELS, model%batch_size))
+        allocate(grad_bottleneck_temp(16, 32, BOTTLENECK_CHANNELS, model%batch_size))
+        allocate(grad_enc3(16, 32, ENC3_CHANNELS, model%batch_size))
+        allocate(grad_enc2(32, 64, ENC2_CHANNELS, model%batch_size))
+        allocate(grad_enc1(64, 128, ENC1_CHANNELS, model%batch_size))
+        allocate(grad_skip1(PADDED_WIDTH, PADDED_HEIGHT, ENC1_CHANNELS, model%batch_size))
+        allocate(grad_skip2(64, 128, ENC2_CHANNELS, model%batch_size))
+        allocate(grad_skip3(32, 64, ENC3_CHANNELS, model%batch_size))
+        allocate(grad_input_padded(PADDED_WIDTH, PADDED_HEIGHT, INPUT_CHANNELS, model%batch_size))
+
+        ! Pad gradient from 240x121 to 256x128
+        call pad_input(grad_output, grad_padded, model%batch_size, INPUT_CHANNELS, &
+                      ORIGINAL_HEIGHT, ORIGINAL_WIDTH, PADDED_HEIGHT, PADDED_WIDTH)
+
+        ! Backward through final conv
+        call conv2d_backward(model%final_conv, model%dec1_out, model%padded_output, &
+                            grad_padded, grad_dec1)
+
+        ! Backward through decoder 1
+        call decoder_backward(model%dec1, model%dec2_out, model%skip1, model%dec1_out, &
+                             grad_dec1, grad_dec2, grad_skip1)
+
+        ! Backward through decoder 2
+        call decoder_backward(model%dec2, model%dec3_out, model%skip2, model%dec2_out, &
+                             grad_dec2, grad_dec3, grad_skip2)
+
+        ! Backward through decoder 3
+        call decoder_backward(model%dec3, model%bottleneck_out, model%skip3, model%dec3_out, &
+                             grad_dec3, grad_bottleneck, grad_skip3)
+
+        ! Backward through bottleneck2
+        call conv2d_backward(model%bottleneck2, model%enc3_out, model%bottleneck_out, &
+                            grad_bottleneck, grad_bottleneck_temp)
+
+        ! Backward through bottleneck1
+        call conv2d_backward(model%bottleneck1, model%enc3_out, model%enc3_out, &
+                            grad_bottleneck_temp, grad_enc3)
+
+        ! Backward through encoder 3 (add gradient from skip3)
+        call add_gradient_arrays(grad_enc3, grad_skip3)
+        call encoder_backward(model%enc3, model%enc2_out, grad_enc3, grad_skip3, grad_enc2)
+
+        ! Backward through encoder 2 (add gradient from skip2)
+        call add_gradient_arrays(grad_enc2, grad_skip2)
+        call encoder_backward(model%enc2, model%enc1_out, grad_enc2, grad_skip2, grad_enc1)
+
+        ! Backward through encoder 1 (add gradient from skip1)
+        call add_gradient_arrays(grad_enc1, grad_skip1)
+        call encoder_backward(model%enc1, model%padded_input, grad_enc1, grad_skip1, grad_input_padded)
+
+        ! Cleanup
+        deallocate(grad_padded, grad_dec1, grad_dec2, grad_dec3)
+        deallocate(grad_bottleneck, grad_bottleneck_temp)
+        deallocate(grad_enc3, grad_enc2, grad_enc1)
+        deallocate(grad_skip1, grad_skip2, grad_skip3)
+        deallocate(grad_input_padded)
+
+    end subroutine unet_backward
+
+    !================================================================
+    ! Helper: Add gradient arrays in-place
+    !================================================================
+    subroutine add_gradient_arrays(dst, src)
+        real(4), device, intent(inout) :: dst(:,:,:,:)
+        real(4), device, intent(in) :: src(:,:,:,:)
+
+        integer :: n, c, h, w, i, j, k, l
+        integer :: dn, dc, dh, dw
+
+        dn = size(dst, 1)
+        dc = size(dst, 2)
+        dh = size(dst, 3)
+        dw = size(dst, 4)
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do l = 1, dw
+            do k = 1, dh
+                do j = 1, dc
+                    do i = 1, dn
+                        dst(i, j, k, l) = dst(i, j, k, l) + src(i, j, k, l)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine add_gradient_arrays
+
+    !================================================================
+    ! Update Weights (convenience function)
+    !================================================================
+    subroutine unet_update(model, lr, timestep)
+        type(climate_unet_t), intent(inout) :: model
+        real(4), intent(in) :: lr
+        integer, intent(in) :: timestep
+
+        call encoder_update(model%enc1, lr, timestep)
+        call encoder_update(model%enc2, lr, timestep)
+        call encoder_update(model%enc3, lr, timestep)
+
+        call conv2d_update(model%bottleneck1, lr, timestep)
+        call conv2d_update(model%bottleneck2, lr, timestep)
+
+        call decoder_update(model%dec3, lr, timestep)
+        call decoder_update(model%dec2, lr, timestep)
+        call decoder_update(model%dec1, lr, timestep)
+
+        call conv2d_update(model%final_conv, lr, timestep)
+
+    end subroutine unet_update
+
+    !================================================================
+    ! Cleanup
+    !================================================================
+    subroutine unet_cleanup(model)
+        type(climate_unet_t), intent(inout) :: model
+
+        if (.not. model%initialized) return
+
+        call encoder_cleanup(model%enc1)
+        call encoder_cleanup(model%enc2)
+        call encoder_cleanup(model%enc3)
+
+        call conv2d_cleanup(model%bottleneck1)
+        call conv2d_cleanup(model%bottleneck2)
+
+        call decoder_cleanup(model%dec3)
+        call decoder_cleanup(model%dec2)
+        call decoder_cleanup(model%dec1)
+
+        call conv2d_cleanup(model%final_conv)
+
+        if (allocated(model%skip1)) deallocate(model%skip1)
+        if (allocated(model%skip2)) deallocate(model%skip2)
+        if (allocated(model%skip3)) deallocate(model%skip3)
+        if (allocated(model%enc1_out)) deallocate(model%enc1_out)
+        if (allocated(model%enc2_out)) deallocate(model%enc2_out)
+        if (allocated(model%enc3_out)) deallocate(model%enc3_out)
+        if (allocated(model%bottleneck_out)) deallocate(model%bottleneck_out)
+        if (allocated(model%dec3_out)) deallocate(model%dec3_out)
+        if (allocated(model%dec2_out)) deallocate(model%dec2_out)
+        if (allocated(model%dec1_out)) deallocate(model%dec1_out)
+        if (allocated(model%padded_input)) deallocate(model%padded_input)
+        if (allocated(model%padded_output)) deallocate(model%padded_output)
+
+        model%initialized = .false.
+
+    end subroutine unet_cleanup
+
+    !================================================================
+    ! Helper: Pad input from 240x121 to 256x128
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine pad_input(input, padded, batch, channels, h_in, w_in, h_out, w_out)
+        real(4), device, intent(in) :: input(w_in, h_in, channels, batch)
+        real(4), device, intent(out) :: padded(w_out, h_out, channels, batch)
+        integer, intent(in) :: batch, channels, h_in, w_in, h_out, w_out
+
+        integer :: n, c, h, w
+
+        ! Initialize to zero
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, channels
+                do h = 1, h_out
+                    do w = 1, w_out
+                        padded(w, h, c, n) = 0.0
+                    end do
+                end do
+            end do
+        end do
+
+        ! Copy input (centered or top-left aligned)
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, channels
+                do h = 1, h_in
+                    do w = 1, w_in
+                        padded(w, h, c, n) = input(w, h, c, n)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine pad_input
+
+    !================================================================
+    ! Helper: Crop output from 256x128 to 240x121
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine crop_output(padded, output, batch, channels, h_in, w_in, h_out, w_out)
+        real(4), device, intent(in) :: padded(w_in, h_in, channels, batch)
+        real(4), device, intent(out) :: output(w_out, h_out, channels, batch)
+        integer, intent(in) :: batch, channels, h_in, w_in, h_out, w_out
+
+        integer :: n, c, h, w
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, batch
+            do c = 1, channels
+                do h = 1, h_out
+                    do w = 1, w_out
+                        output(w, h, c, n) = padded(w, h, c, n)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine crop_output
+
+end module climate_unet_module

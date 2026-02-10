@@ -1,0 +1,29 @@
+! Quick test to verify gradient loading
+program test_grad_load
+    implicit none
+
+    real(4), allocatable :: grad(:,:,:,:)
+    integer :: i, j, k, l
+
+    allocate(grad(3, 3, 1, 16))
+
+    open(unit=100, file='../pytorch_reference/fortran_validation/conv1_weight_grad.bin', &
+         form='unformatted', access='stream', status='old')
+    read(100) grad
+    close(100)
+
+    print *, "Conv1 weight gradient shape: (3, 3, 1, 16)"
+    print *, "First few values:"
+    print *, "grad(1,1,1,1) = ", grad(1,1,1,1)
+    print *, "grad(2,1,1,1) = ", grad(2,1,1,1)
+    print *, "grad(3,1,1,1) = ", grad(3,1,1,1)
+    print *, "grad(1,2,1,1) = ", grad(1,2,1,1)
+    print *, ""
+    print *, ""
+    print *, "Min/Max values:"
+    print *, "  Min: ", minval(grad)
+    print *, "  Max: ", maxval(grad)
+
+    deallocate(grad)
+
+end program test_grad_load

@@ -1,0 +1,73 @@
+!================================================================
+! Test Without Padding
+!================================================================
+program test_no_padding
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    integer, parameter :: IMAGE_SIZE = 10  ! Small for easy calculation
+    integer, parameter :: BATCH_SIZE = 1
+
+    type(c_ptr) :: cudnn_handle
+    type(conv2d_layer_t) :: conv
+    integer :: stat
+
+    real(4), device, allocatable :: input(:,:,:,:), output(:,:,:,:)
+    real(4), allocatable :: h_input(:,:,:,:), h_output(:,:,:,:)
+    real(4), allocatable :: w(:,:,:,:), b(:)
+
+    print *, "Test: 1x1 convolution (no spatial filtering)"
+    print *, ""
+
+    stat = cudnnCreate(cudnn_handle)
+    ! kernel_size=1, padding=0 means output = input * weight + bias (point-wise)
+    call conv2d_init(conv, cudnn_handle, 1, 1, 1, 0, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    allocate(input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(w(1,1,1,1), b(1))
+
+    h_input = 0.5
+    input = h_input
+
+    print *, "=== 1x1 conv: weight=2.0, bias=1.0 ==="
+    w = 2.0
+    b = 1.0
+    conv%weights = w
+    conv%bias = b
+    
+    call conv2d_forward(conv, input, output)
+    h_output = output
+    
+    print *, "Expected: 2.0 * 0.5 + 1.0 = 2.0"
+    print *, "Actual:", sum(h_output)/size(h_output)
+    print *, ""
+
+    print *, "=== 1x1 conv: weight=0.0, bias=3.0 ==="
+    w = 0.0
+    b = 3.0
+    conv%weights = w
+    conv%bias = b
+    
+    call conv2d_forward(conv, input, output)
+    h_output = output
+    
+    print *, "Expected: 0.0 * 0.5 + 3.0 = 3.0"
+    print *, "Actual:", sum(h_output)/size(h_output)
+    print *, ""
+
+    call conv2d_cleanup(conv)
+
+end program test_no_padding

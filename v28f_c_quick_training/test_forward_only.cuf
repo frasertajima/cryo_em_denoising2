@@ -1,0 +1,99 @@
+!================================================================
+! Forward Pass Only Test
+!================================================================
+! Set specific weight values and verify the output
+!================================================================
+program test_forward_only
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    integer, parameter :: IMAGE_SIZE = 64
+    integer, parameter :: BATCH_SIZE = 1
+
+    type(c_ptr) :: cudnn_handle
+    type(conv2d_layer_t) :: conv
+    integer :: stat
+
+    real(4), device, allocatable :: input(:,:,:,:), output(:,:,:,:)
+    real(4), allocatable :: h_input(:,:,:,:), h_output(:,:,:,:)
+    real(4), allocatable :: w(:,:,:,:), b(:)
+
+    print *, "========================================"
+    print *, "  Forward Pass Only Test"
+    print *, "========================================"
+    print *, ""
+
+    stat = cudnnCreate(cudnn_handle)
+    call conv2d_init(conv, cudnn_handle, 1, 1, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    allocate(input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(w(1,1,3,3), b(1))
+
+    ! Set constant input
+    h_input = 0.5
+    input = h_input
+
+    print *, "=== TEST 1: All weights = 0.1, bias = 0 ==="
+    w = 0.1
+    b = 0.0
+    conv%weights = w
+    conv%bias = b
+    
+    call conv2d_forward(conv, input, output)
+    h_output = output
+    
+    print *, "Weights: all 0.1"
+    print *, "Bias: 0.0"
+    print *, "Input: all 0.5"
+    print *, "Expected output: 0.1 * 0.5 * 9 = 0.45"
+    print *, "Actual output mean:", sum(h_output)/size(h_output)
+    print *, ""
+
+    print *, "=== TEST 2: All weights = 0.0, bias = 0.5 ==="
+    w = 0.0
+    b = 0.5
+    conv%weights = w
+    conv%bias = b
+    
+    call conv2d_forward(conv, input, output)
+    h_output = output
+    
+    print *, "Weights: all 0.0"
+    print *, "Bias: 0.5"
+    print *, "Input: all 0.5"
+    print *, "Expected output: 0.5"
+    print *, "Actual output mean:", sum(h_output)/size(h_output)
+    print *, ""
+
+    print *, "=== TEST 3: All weights = 1.0, bias = 0 ==="
+    w = 1.0
+    b = 0.0
+    conv%weights = w
+    conv%bias = b
+    
+    call conv2d_forward(conv, input, output)
+    h_output = output
+    
+    print *, "Weights: all 1.0"
+    print *, "Bias: 0.0"
+    print *, "Input: all 0.5"
+    print *, "Expected output: 1.0 * 0.5 * 9 = 4.5"
+    print *, "Actual output mean:", sum(h_output)/size(h_output)
+    print *, ""
+
+    call conv2d_cleanup(conv)
+
+end program test_forward_only

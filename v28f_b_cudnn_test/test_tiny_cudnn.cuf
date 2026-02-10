@@ -1,0 +1,285 @@
+!================================================================
+! Tiny cuDNN Backward Pass Verification Test
+!================================================================
+! Ultra-minimal test: 1→2 channels, 2×2 kernel, 4×4 input
+! Small enough to verify every gradient value manually
+!================================================================
+program test_tiny_cudnn
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    ! cuDNN C interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    ! Tiny test parameters
+    integer, parameter :: BATCH_SIZE = 1
+    integer, parameter :: IMAGE_SIZE = 4
+    integer, parameter :: IN_CHANNELS = 1
+    integer, parameter :: OUT_CHANNELS = 2
+    integer, parameter :: KERNEL_SIZE = 2
+    integer, parameter :: OUTPUT_SIZE = 3  ! 4 - 2 + 1 = 3
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+    integer :: stat
+
+    ! Layer
+    type(conv2d_layer_t) :: conv
+
+    ! Device arrays
+    real(4), device, allocatable :: input(:,:,:,:)
+    real(4), device, allocatable :: target(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+    real(4), device, allocatable :: grad_input(:,:,:,:)
+    real(4), device, allocatable :: temp_output(:,:,:,:)
+
+    ! Host arrays for loading
+    real(4), allocatable :: host_input(:,:,:,:)
+    real(4), allocatable :: host_target(:,:,:,:)
+    real(4), allocatable :: host_output(:,:,:,:)
+    real(4), allocatable :: host_temp(:,:,:,:)
+
+    ! PyTorch gradients (H, W, In, Out)
+    real(4), allocatable :: pytorch_grad_w(:,:,:,:)
+    real(4), allocatable :: pytorch_grad_b(:)
+
+    ! Fortran gradients for comparison
+    real(4), allocatable :: fortran_grad_w(:,:,:,:)
+    real(4), allocatable :: fortran_grad_b(:)
+    real(4), allocatable :: fortran_grad_w_transformed(:,:,:,:)
+
+    ! Metrics
+    real(4) :: loss
+    real(4) :: max_diff, mean_diff, diff
+    integer :: i, j, k, l
+
+    print *, ""
+    print *, "============================================================"
+    print *, "  Tiny cuDNN Backward Pass Verification"
+    print *, "============================================================"
+    print *, ""
+    print *, "Network: Conv2d(in=1, out=2, kernel=2×2)"
+    print *, "Input shape: (1, 1, 4, 4)"
+    print *, "Output shape: (1, 2, 3, 3)"
+    print *, ""
+
+    ! Initialize cuDNN
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) stop "cuDNN init failed"
+
+    ! Initialize tiny conv layer
+    call conv2d_init(conv, cudnn_handle, IN_CHANNELS, OUT_CHANNELS, KERNEL_SIZE, &
+                     0, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    ! Allocate arrays
+    allocate(input(IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(target(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+    allocate(output(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+    allocate(temp_output(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+    allocate(grad_output(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+    allocate(grad_input(IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+
+    allocate(host_input(IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, BATCH_SIZE))
+    allocate(host_target(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+    allocate(host_output(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+    allocate(host_temp(OUT_CHANNELS, OUTPUT_SIZE, OUTPUT_SIZE, BATCH_SIZE))
+
+    ! Load test data
+    call load_binary_4d('tiny_test/input.bin', host_input)
+    call load_binary_4d('tiny_test/target.bin', host_target)
+
+    ! Load weights - allocate temp arrays first
+    allocate(pytorch_grad_w(KERNEL_SIZE, KERNEL_SIZE, IN_CHANNELS, OUT_CHANNELS))
+    allocate(pytorch_grad_b(OUT_CHANNELS))
+    call load_binary_4d('tiny_test/weight.bin', pytorch_grad_w)
+    call load_binary_1d('tiny_test/bias.bin', pytorch_grad_b)
+
+    ! Transform: (H,W,In,Out) from PyTorch export -> (Out,In,H,W) for cuDNN
+    ! Undo the flip+transpose from export
+    do l = 1, OUT_CHANNELS
+        do k = 1, IN_CHANNELS
+            do j = 1, KERNEL_SIZE
+                do i = 1, KERNEL_SIZE
+                    ! Undo flip: pytorch_grad_w has flipped spatial dims
+                    conv%weights(l, k, i, j) = pytorch_grad_w(KERNEL_SIZE-i+1, KERNEL_SIZE-j+1, k, l)
+                end do
+            end do
+        end do
+    end do
+    conv%bias = pytorch_grad_b
+
+    ! Debug: Print loaded weights (copy to host first)
+    allocate(fortran_grad_w(OUT_CHANNELS, IN_CHANNELS, KERNEL_SIZE, KERNEL_SIZE))
+    allocate(fortran_grad_b(OUT_CHANNELS))
+    fortran_grad_w = conv%weights
+    fortran_grad_b = conv%bias
+    print *, "Loaded weights (Out, In, H, W):"
+    do l = 1, OUT_CHANNELS
+        print *, "  Output channel", l, ":"
+        do k = 1, IN_CHANNELS
+            print *, "    Input channel", k, ":"
+            do i = 1, KERNEL_SIZE
+                print '(A,I0,A,4F12.6)', "      Row ", i, ": ", fortran_grad_w(l,k,i,:)
+            end do
+        end do
+    end do
+    print *, "Loaded bias:", fortran_grad_b
+    print *, ""
+    print *, "Input (first few values):"
+    print *, "  ", host_input(1,1,1:4,1)
+    print *, "Target (first output channel, first few):"
+    print *, "  ", host_target(1,1,1:3,1)
+    print *, ""
+
+    ! Copy to device
+    input = host_input
+    target = host_target
+
+    ! Forward pass
+    call conv2d_forward(conv, input, output)
+
+    ! Copy output to host for loss/gradient computation
+    host_output = output
+
+    print *, "Forward output (first row, both channels):"
+    print *, "  Channel 0:", host_output(1,1:3,1,1)
+    print *, "  Channel 1:", host_output(2,1:3,1,1)
+    print *, ""
+    host_temp = host_output - host_target  ! pred - target
+    loss = sum(host_temp**2) / (OUT_CHANNELS * OUTPUT_SIZE * OUTPUT_SIZE * BATCH_SIZE)
+    host_temp = 2.0 * host_temp / (OUT_CHANNELS * OUTPUT_SIZE * OUTPUT_SIZE * BATCH_SIZE)
+    grad_output = host_temp  ! Copy gradient back to device
+
+    print *, "Forward loss:", loss
+    print *, ""
+
+    ! Backward pass (need input and output for full backward)
+    call conv2d_backward(conv, input, output, grad_output, grad_input, compute_grad_input=.true.)
+
+    ! Copy gradients to host (reuse previously allocated arrays)
+    allocate(fortran_grad_w_transformed(KERNEL_SIZE, KERNEL_SIZE, IN_CHANNELS, OUT_CHANNELS))
+
+    fortran_grad_w = conv%grad_weights
+    fortran_grad_b = conv%grad_bias
+
+    ! Load PyTorch gradients (already in H, W, In, Out format) - reuse allocated arrays
+    call load_binary_4d('tiny_test/grad_weight.bin', pytorch_grad_w)
+    call load_binary_1d('tiny_test/grad_bias.bin', pytorch_grad_b)
+
+    ! Transform Fortran gradients: (Out, In, H, W) -> (H, W, In, Out) with flip
+    do l = 1, OUT_CHANNELS
+        do k = 1, IN_CHANNELS
+            do j = 1, KERNEL_SIZE
+                do i = 1, KERNEL_SIZE
+                    fortran_grad_w_transformed(i, j, k, l) = &
+                        fortran_grad_w(l, k, KERNEL_SIZE-i+1, KERNEL_SIZE-j+1)
+                end do
+            end do
+        end do
+    end do
+
+    ! Print detailed comparison
+    print *, "============================================================"
+    print *, "Weight Gradient Comparison"
+    print *, "============================================================"
+    print *, ""
+
+    print *, "PyTorch gradients (H, W, In, Out):"
+    do l = 1, OUT_CHANNELS
+        print *, "  Output channel", l, ":"
+        do k = 1, IN_CHANNELS
+            print *, "    Input channel", k, ":"
+            do i = 1, KERNEL_SIZE
+                print '(A,I0,A,4F12.6)', "      Row ", i, ": ", pytorch_grad_w(i,:,k,l)
+            end do
+        end do
+    end do
+    print *, ""
+
+    print *, "Fortran gradients (transformed to H, W, In, Out):"
+    do l = 1, OUT_CHANNELS
+        print *, "  Output channel", l, ":"
+        do k = 1, IN_CHANNELS
+            print *, "    Input channel", k, ":"
+            do i = 1, KERNEL_SIZE
+                print '(A,I0,A,4F12.6)', "      Row ", i, ": ", fortran_grad_w_transformed(i,:,k,l)
+            end do
+        end do
+    end do
+    print *, ""
+
+    print *, "Differences (Fortran - PyTorch):"
+    max_diff = 0.0
+    mean_diff = 0.0
+    do l = 1, OUT_CHANNELS
+        print *, "  Output channel", l, ":"
+        do k = 1, IN_CHANNELS
+            print *, "    Input channel", k, ":"
+            do i = 1, KERNEL_SIZE
+                do j = 1, KERNEL_SIZE
+                    diff = abs(fortran_grad_w_transformed(i,j,k,l) - pytorch_grad_w(i,j,k,l))
+                    max_diff = max(max_diff, diff)
+                    mean_diff = mean_diff + diff
+                end do
+                print '(A,I0,A,4ES12.3)', "      Row ", i, ": ", &
+                    (fortran_grad_w_transformed(i,j,k,l) - pytorch_grad_w(i,j,k,l), j=1,KERNEL_SIZE)
+            end do
+        end do
+    end do
+    mean_diff = mean_diff / (OUT_CHANNELS * IN_CHANNELS * KERNEL_SIZE * KERNEL_SIZE)
+
+    print *, ""
+    print *, "============================================================"
+    print *, "Summary:"
+    print *, "  Max difference:  ", max_diff
+    print *, "  Mean difference: ", mean_diff
+    print *, ""
+
+    ! Bias gradients
+    print *, "Bias Gradient Comparison:"
+    print *, "  PyTorch: ", pytorch_grad_b
+    print *, "  Fortran: ", fortran_grad_b
+    print *, "  Diff:    ", abs(fortran_grad_b - pytorch_grad_b)
+    print *, ""
+
+    if (max_diff < 1e-5) then
+        print *, "✓ PASS: Weight gradients match to 1e-5"
+    else if (max_diff < 1e-3) then
+        print *, "⚠ WARNING: Weight gradients differ by", max_diff
+    else
+        print *, "✗ FAIL: Weight gradients differ significantly by", max_diff
+    end if
+
+    print *, ""
+    print *, "============================================================"
+
+contains
+
+    subroutine load_binary_4d(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(:,:,:,:)
+
+        open(unit=100, file=trim(filename), form='unformatted', access='stream', status='old')
+        read(100) array
+        close(100)
+    end subroutine
+
+    subroutine load_binary_1d(filename, array)
+        character(len=*), intent(in) :: filename
+        real(4), intent(out) :: array(:)
+
+        open(unit=100, file=trim(filename), form='unformatted', access='stream', status='old')
+        read(100) array
+        close(100)
+    end subroutine
+
+end program test_tiny_cudnn

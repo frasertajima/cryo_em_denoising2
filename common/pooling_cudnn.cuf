@@ -1,0 +1,358 @@
+!================================================================
+! Pooling Module - MaxPool and Upsample for U-Net
+!================================================================
+! Provides pooling and upsampling operations using cuDNN.
+!
+! Features:
+!   - MaxPool2D with configurable kernel/stride
+!   - Bilinear upsampling for decoder
+!   - Proper backward pass support
+!
+! Usage:
+!   type(maxpool2d_layer_t) :: pool
+!   call maxpool2d_init(pool, cudnn_handle, 2, 2, batch, channels, h, w)
+!   call maxpool2d_forward(pool, input, output)
+!   call maxpool2d_backward(pool, input, output, grad_output, grad_input)
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-22
+!================================================================
+module pooling_cudnn
+    use cudafor
+    use iso_c_binding
+    implicit none
+
+    !================================================================
+    ! cuDNN Constants
+    !================================================================
+    integer(c_int), parameter :: CUDNN_STATUS_SUCCESS = 0
+    integer(c_int), parameter :: CUDNN_TENSOR_NCHW = 0
+    integer(c_int), parameter :: CUDNN_DATA_FLOAT = 0
+    integer(c_int), parameter :: CUDNN_POOLING_MAX = 0
+    integer(c_int), parameter :: CUDNN_PROPAGATE_NAN = 0
+
+    !================================================================
+    ! MaxPool2D Layer Type
+    !================================================================
+    type :: maxpool2d_layer_t
+        integer :: kernel_size
+        integer :: stride
+        integer :: batch_size
+        integer :: channels
+        integer :: in_height, in_width
+        integer :: out_height, out_width
+
+        type(c_ptr) :: input_desc = c_null_ptr
+        type(c_ptr) :: output_desc = c_null_ptr
+        type(c_ptr) :: pooling_desc = c_null_ptr
+        type(c_ptr) :: cudnn_handle = c_null_ptr
+
+        logical :: initialized = .false.
+    end type maxpool2d_layer_t
+
+    !================================================================
+    ! Upsample2D Layer Type (for decoder)
+    !================================================================
+    type :: upsample2d_layer_t
+        integer :: scale_factor
+        integer :: batch_size
+        integer :: channels
+        integer :: in_height, in_width
+        integer :: out_height, out_width
+
+        logical :: initialized = .false.
+    end type upsample2d_layer_t
+
+    !================================================================
+    ! cuDNN C Interface
+    !================================================================
+    interface
+        function cudnnCreateTensorDescriptor(desc) bind(c, name='cudnnCreateTensorDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: desc
+            integer(c_int) :: cudnnCreateTensorDescriptor
+        end function
+
+        function cudnnSetTensor4dDescriptor(desc, format, datatype, n, c, h, w) &
+                bind(c, name='cudnnSetTensor4dDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int), value :: format, datatype, n, c, h, w
+            integer(c_int) :: cudnnSetTensor4dDescriptor
+        end function
+
+        function cudnnDestroyTensorDescriptor(desc) bind(c, name='cudnnDestroyTensorDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int) :: cudnnDestroyTensorDescriptor
+        end function
+
+        function cudnnCreatePoolingDescriptor(desc) bind(c, name='cudnnCreatePoolingDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: desc
+            integer(c_int) :: cudnnCreatePoolingDescriptor
+        end function
+
+        function cudnnSetPooling2dDescriptor(desc, mode, nan_opt, window_h, window_w, &
+                                             pad_h, pad_w, stride_h, stride_w) &
+                bind(c, name='cudnnSetPooling2dDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int), value :: mode, nan_opt, window_h, window_w
+            integer(c_int), value :: pad_h, pad_w, stride_h, stride_w
+            integer(c_int) :: cudnnSetPooling2dDescriptor
+        end function
+
+        function cudnnDestroyPoolingDescriptor(desc) bind(c, name='cudnnDestroyPoolingDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int) :: cudnnDestroyPoolingDescriptor
+        end function
+
+        function cudnnPoolingForward(handle, pool_desc, alpha, x_desc, x, beta, y_desc, y) &
+                bind(c, name='cudnnPoolingForward')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle, pool_desc, alpha, x_desc, x, beta, y_desc, y
+            integer(c_int) :: cudnnPoolingForward
+        end function
+
+        function cudnnPoolingBackward(handle, pool_desc, alpha, y_desc, y, dy_desc, dy, &
+                                      x_desc, x, beta, dx_desc, dx) &
+                bind(c, name='cudnnPoolingBackward')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle, pool_desc, alpha, y_desc, y, dy_desc, dy
+            type(c_ptr), value :: x_desc, x, beta, dx_desc, dx
+            integer(c_int) :: cudnnPoolingBackward
+        end function
+    end interface
+
+    public :: maxpool2d_layer_t, upsample2d_layer_t
+    public :: maxpool2d_init, maxpool2d_forward, maxpool2d_backward, maxpool2d_cleanup
+    public :: upsample2d_init, upsample2d_forward, upsample2d_backward, upsample2d_cleanup
+    public :: maxpool2d_set_batch_size
+
+contains
+
+    !================================================================
+    ! Initialize MaxPool2D Layer
+    !================================================================
+    subroutine maxpool2d_init(layer, handle, kernel_size, stride, &
+                              batch_size, channels, in_height, in_width)
+        type(maxpool2d_layer_t), intent(inout) :: layer
+        type(c_ptr), intent(in) :: handle
+        integer, intent(in) :: kernel_size, stride
+        integer, intent(in) :: batch_size, channels, in_height, in_width
+
+        integer :: stat
+
+        layer%cudnn_handle = handle
+        layer%kernel_size = kernel_size
+        layer%stride = stride
+        layer%batch_size = batch_size
+        layer%channels = channels
+        layer%in_height = in_height
+        layer%in_width = in_width
+
+        ! Calculate output dimensions
+        layer%out_height = (in_height - kernel_size) / stride + 1
+        layer%out_width = (in_width - kernel_size) / stride + 1
+
+        ! Create tensor descriptors
+        stat = cudnnCreateTensorDescriptor(layer%input_desc)
+        stat = cudnnSetTensor4dDescriptor(layer%input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         batch_size, channels, in_height, in_width)
+
+        stat = cudnnCreateTensorDescriptor(layer%output_desc)
+        stat = cudnnSetTensor4dDescriptor(layer%output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         batch_size, channels, layer%out_height, layer%out_width)
+
+        ! Create pooling descriptor
+        stat = cudnnCreatePoolingDescriptor(layer%pooling_desc)
+        stat = cudnnSetPooling2dDescriptor(layer%pooling_desc, CUDNN_POOLING_MAX, CUDNN_PROPAGATE_NAN, &
+                                          kernel_size, kernel_size, 0, 0, stride, stride)
+
+        layer%initialized = .true.
+
+    end subroutine maxpool2d_init
+
+    !================================================================
+    ! Update Batch Size
+    !================================================================
+    subroutine maxpool2d_set_batch_size(layer, new_batch_size)
+        type(maxpool2d_layer_t), intent(inout) :: layer
+        integer, intent(in) :: new_batch_size
+
+        integer :: stat
+
+        if (new_batch_size == layer%batch_size) return
+
+        layer%batch_size = new_batch_size
+
+        stat = cudnnSetTensor4dDescriptor(layer%input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         new_batch_size, layer%channels, layer%in_height, layer%in_width)
+        stat = cudnnSetTensor4dDescriptor(layer%output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         new_batch_size, layer%channels, layer%out_height, layer%out_width)
+
+    end subroutine maxpool2d_set_batch_size
+
+    !================================================================
+    ! MaxPool2D Forward
+    !================================================================
+    subroutine maxpool2d_forward(layer, input, output)
+        type(maxpool2d_layer_t), intent(in) :: layer
+        real(4), device, intent(in) :: input(*)
+        real(4), device, intent(out) :: output(*)
+
+        real(4), target :: alpha = 1.0, beta = 0.0
+        integer :: stat
+
+        stat = cudnnPoolingForward(layer%cudnn_handle, layer%pooling_desc, &
+                                   c_loc(alpha), layer%input_desc, c_loc(input), &
+                                   c_loc(beta), layer%output_desc, c_loc(output))
+
+        if (stat /= CUDNN_STATUS_SUCCESS) then
+            print *, "ERROR: cudnnPoolingForward failed with status", stat
+        endif
+
+    end subroutine maxpool2d_forward
+
+    !================================================================
+    ! MaxPool2D Backward
+    !================================================================
+    subroutine maxpool2d_backward(layer, input, output, grad_output, grad_input)
+        type(maxpool2d_layer_t), intent(in) :: layer
+        real(4), device, intent(in) :: input(*)       ! Original input
+        real(4), device, intent(in) :: output(*)      ! Forward output
+        real(4), device, intent(in) :: grad_output(*) ! Gradient from next layer
+        real(4), device, intent(out) :: grad_input(*) ! Gradient to previous layer
+
+        real(4), target :: alpha = 1.0, beta = 0.0
+        integer :: stat
+
+        stat = cudnnPoolingBackward(layer%cudnn_handle, layer%pooling_desc, &
+                                    c_loc(alpha), layer%output_desc, c_loc(output), &
+                                    layer%output_desc, c_loc(grad_output), &
+                                    layer%input_desc, c_loc(input), &
+                                    c_loc(beta), layer%input_desc, c_loc(grad_input))
+
+        if (stat /= CUDNN_STATUS_SUCCESS) then
+            print *, "ERROR: cudnnPoolingBackward failed with status", stat
+        endif
+
+    end subroutine maxpool2d_backward
+
+    !================================================================
+    ! MaxPool2D Cleanup
+    !================================================================
+    subroutine maxpool2d_cleanup(layer)
+        type(maxpool2d_layer_t), intent(inout) :: layer
+
+        integer :: stat
+
+        if (.not. layer%initialized) return
+
+        if (c_associated(layer%input_desc)) stat = cudnnDestroyTensorDescriptor(layer%input_desc)
+        if (c_associated(layer%output_desc)) stat = cudnnDestroyTensorDescriptor(layer%output_desc)
+        if (c_associated(layer%pooling_desc)) stat = cudnnDestroyPoolingDescriptor(layer%pooling_desc)
+
+        layer%initialized = .false.
+
+    end subroutine maxpool2d_cleanup
+
+    !================================================================
+    ! Initialize Upsample2D Layer (Nearest Neighbor)
+    !================================================================
+    subroutine upsample2d_init(layer, scale_factor, batch_size, channels, in_height, in_width)
+        type(upsample2d_layer_t), intent(inout) :: layer
+        integer, intent(in) :: scale_factor
+        integer, intent(in) :: batch_size, channels, in_height, in_width
+
+        layer%scale_factor = scale_factor
+        layer%batch_size = batch_size
+        layer%channels = channels
+        layer%in_height = in_height
+        layer%in_width = in_width
+        layer%out_height = in_height * scale_factor
+        layer%out_width = in_width * scale_factor
+
+        layer%initialized = .true.
+
+    end subroutine upsample2d_init
+
+    !================================================================
+    ! Upsample2D Forward (Nearest Neighbor)
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine upsample2d_forward(layer, input, output)
+        type(upsample2d_layer_t), intent(in) :: layer
+        real(4), device, intent(in) :: input(layer%in_width, layer%in_height, &
+                                             layer%channels, layer%batch_size)
+        real(4), device, intent(out) :: output(layer%out_width, layer%out_height, &
+                                               layer%channels, layer%batch_size)
+
+        integer :: n, c, h, w, ih, iw, sf
+
+        sf = layer%scale_factor
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, layer%batch_size
+            do c = 1, layer%channels
+                do h = 1, layer%out_height
+                    do w = 1, layer%out_width
+                        ih = (h - 1) / sf + 1
+                        iw = (w - 1) / sf + 1
+                        output(w, h, c, n) = input(iw, ih, c, n)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine upsample2d_forward
+
+    !================================================================
+    ! Upsample2D Backward (sum gradients in each block)
+    ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+    !================================================================
+    subroutine upsample2d_backward(layer, grad_output, grad_input)
+        type(upsample2d_layer_t), intent(in) :: layer
+        real(4), device, intent(in) :: grad_output(layer%out_width, layer%out_height, &
+                                                   layer%channels, layer%batch_size)
+        real(4), device, intent(out) :: grad_input(layer%in_width, layer%in_height, &
+                                                   layer%channels, layer%batch_size)
+
+        integer :: n, c, ih, iw, dh, dw, sf
+        real(4) :: grad_sum
+
+        sf = layer%scale_factor
+
+        ! Each input pixel receives sum of gradients from its sf x sf output block
+        !$cuf kernel do(4) <<< *, * >>>
+        do n = 1, layer%batch_size
+            do c = 1, layer%channels
+                do ih = 1, layer%in_height
+                    do iw = 1, layer%in_width
+                        grad_sum = 0.0
+                        do dh = 1, sf
+                            do dw = 1, sf
+                                grad_sum = grad_sum + grad_output((iw-1)*sf + dw, (ih-1)*sf + dh, c, n)
+                            end do
+                        end do
+                        grad_input(iw, ih, c, n) = grad_sum
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine upsample2d_backward
+
+    !================================================================
+    ! Upsample2D Cleanup
+    !================================================================
+    subroutine upsample2d_cleanup(layer)
+        type(upsample2d_layer_t), intent(inout) :: layer
+
+        layer%initialized = .false.
+
+    end subroutine upsample2d_cleanup
+
+end module pooling_cudnn

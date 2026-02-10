@@ -1,0 +1,143 @@
+! Test the full forward pass and loss calculation
+program test_forward_pass
+    use streaming_cryo_loader
+    use conv2d_cudnn
+    use cudafor
+    use iso_c_binding
+    implicit none
+
+    interface
+        integer(c_int) function cudnnCreate(handle) bind(C, name='cudnnCreate')
+            use iso_c_binding
+            type(c_ptr) :: handle
+        end function
+        integer(c_int) function cudnnDestroy(handle) bind(C, name='cudnnDestroy')
+            use iso_c_binding
+            type(c_ptr), value :: handle
+        end function
+    end interface
+
+    integer, parameter :: IMG_SIZE = 1024
+    integer, parameter :: MY_BATCH_SIZE = 4
+    integer, parameter :: HIDDEN_CHANNELS = 16
+
+    type(conv2d_layer_t) :: conv1, conv2, conv3
+    type(c_ptr) :: cudnn_handle
+
+    real(4), managed, allocatable :: batch_noisy_flat(:,:), batch_clean_flat(:,:)
+    real(4), device, allocatable :: batch_input(:,:,:,:), batch_target(:,:,:,:)
+    real(4), device, allocatable :: hidden1(:,:,:,:), hidden2(:,:,:,:), output(:,:,:,:)
+    real(4), device, allocatable :: grad_output(:,:,:,:)
+
+    real(4), allocatable :: h_output(:,:,:,:), h_target(:,:,:,:)
+    real(4) :: loss, expected_high_loss
+    integer :: actual_batch_size, istat, total_elements
+
+    print *, "="*70
+    print *, "Testing Full Forward Pass + Loss"
+    print *, "="*70
+
+    ! Initialize cuDNN
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) stop "Failed to create cuDNN"
+
+    ! Create layers
+    call conv2d_create(conv1, cudnn_handle, 1, 16, 3, IMG_SIZE, IMG_SIZE, MY_BATCH_SIZE)
+    call conv2d_create(conv2, cudnn_handle, 16, 16, 3, IMG_SIZE, IMG_SIZE, MY_BATCH_SIZE)
+    call conv2d_create(conv3, cudnn_handle, 16, 1, 3, IMG_SIZE, IMG_SIZE, MY_BATCH_SIZE)
+
+    ! Allocate arrays
+    allocate(batch_noisy_flat(IMG_SIZE*IMG_SIZE, MY_BATCH_SIZE))
+    allocate(batch_clean_flat(IMG_SIZE*IMG_SIZE, MY_BATCH_SIZE))
+    allocate(batch_input(IMG_SIZE, IMG_SIZE, 1, MY_BATCH_SIZE))
+    allocate(batch_target(IMG_SIZE, IMG_SIZE, 1, MY_BATCH_SIZE))
+    allocate(hidden1(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, MY_BATCH_SIZE))
+    allocate(hidden2(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, MY_BATCH_SIZE))
+    allocate(output(IMG_SIZE, IMG_SIZE, 1, MY_BATCH_SIZE))
+    allocate(grad_output(IMG_SIZE, IMG_SIZE, 1, MY_BATCH_SIZE))
+
+    ! Initialize loader
+    call cryo_loader_init('../data/cryo_data_streaming/train_input.bin', &
+                          '../data/cryo_data_streaming/train_target.bin', &
+                          29913, MY_BATCH_SIZE)
+    call cryo_loader_start_epoch()
+
+    ! Get first batch
+    call cryo_loader_get_batch(batch_noisy_flat, batch_clean_flat, actual_batch_size)
+    print *, "Got batch with", actual_batch_size, "patches"
+
+    ! Reshape (inline version of reshape_flat_to_4d)
+    call reshape_data(batch_noisy_flat, batch_input, actual_batch_size)
+    call reshape_data(batch_clean_flat, batch_target, actual_batch_size)
+
+    print *, "Running forward pass..."
+
+    ! Forward pass (with random weights - should give high loss)
+    call conv2d_forward(conv1, batch_input, hidden1)
+    call relu_forward(hidden1, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+    call conv2d_forward(conv2, hidden1, hidden2)
+    call relu_forward(hidden2, actual_batch_size, HIDDEN_CHANNELS, IMG_SIZE, IMG_SIZE)
+
+    call conv2d_forward(conv3, hidden2, output)
+
+    ! Compute loss
+    total_elements = actual_batch_size * 1 * IMG_SIZE * IMG_SIZE
+
+    allocate(h_output(IMG_SIZE, IMG_SIZE, 1, actual_batch_size))
+    allocate(h_target(IMG_SIZE, IMG_SIZE, 1, actual_batch_size))
+
+    h_output = output(:, :, :, 1:actual_batch_size)
+    h_target = batch_target(:, :, :, 1:actual_batch_size)
+    istat = cudaDeviceSynchronize()
+
+    loss = sum((h_output - h_target)**2) / real(total_elements)
+
+    print *, ""
+    print *, "="*70
+    print *, "RESULTS"
+    print *, "="*70
+    print *, "Loss with random weights: ", loss
+    print *, ""
+    print *, "Expected: Loss should be HIGH (>0.1) with random weights"
+    print *, "  Target mean: ", sum(h_target) / size(h_target)
+    print *, "  Output mean: ", sum(h_output) / size(h_output)
+    print *, ""
+
+    if (loss < 0.01) then
+        print *, "✗ ERROR: Loss is suspiciously low!"
+        print *, "  Random weights should NOT give good predictions"
+        print *, "  Something is broken in forward/loss calculation"
+    else if (loss > 1.0) then
+        print *, "✗ WARNING: Loss is very high (>1.0)"
+        print *, "  May indicate numerical issues"
+    else
+        print *, "✓ Loss looks reasonable for random weights"
+    end if
+
+    ! Cleanup
+    call cryo_loader_cleanup()
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+    call conv2d_cleanup(conv3)
+    istat = cudnnDestroy(cudnn_handle)
+
+contains
+
+    subroutine reshape_data(flat, tensor_4d, batch_size)
+        real(4), managed, intent(in) :: flat(:,:)
+        real(4), device, intent(out) :: tensor_4d(:,:,:,:)
+        integer, intent(in) :: batch_size
+        integer :: b, idx, w, h
+
+        !$cuf kernel do(2) <<< *, * >>>
+        do b = 1, batch_size
+            do idx = 1, IMG_SIZE * IMG_SIZE
+                h = (idx - 1) / IMG_SIZE + 1
+                w = mod(idx - 1, IMG_SIZE) + 1
+                tensor_4d(w, h, 1, b) = flat(idx, b)
+            end do
+        end do
+    end subroutine reshape_data
+
+end program test_forward_pass

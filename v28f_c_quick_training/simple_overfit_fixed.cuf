@@ -1,0 +1,174 @@
+!================================================================
+! Simple Overfit Test (Refactored)
+!================================================================
+program simple_overfit_test
+    use cudafor
+    use conv2d_cudnn
+    use iso_c_binding
+    implicit none
+
+    ! cuDNN C interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr) :: handle
+            integer(c_int) :: cudnnCreate
+        end function cudnnCreate
+    end interface
+
+    ! Configuration
+    integer, parameter :: IMAGE_SIZE = 64
+    integer, parameter :: BATCH_SIZE = 1
+    integer, parameter :: NUM_STEPS = 500
+    real(4), parameter :: LEARNING_RATE = 0.001
+
+    ! cuDNN
+    type(c_ptr) :: cudnn_handle
+    integer :: stat
+
+    ! Single conv layer
+    type(conv2d_layer_t) :: conv
+
+    ! Arrays
+    ! [FIX] Dimensions updated to (Width, Height, Channels, Batch)
+    ! This maps to NCHW in physical memory for cuDNN
+    real(4), device, allocatable :: input(:,:,:,:), output(:,:,:,:), target(:,:,:,:)
+    real(4), device, allocatable :: grad_output(:,:,:,:), grad_input(:,:,:,:)
+    real(4), allocatable :: h_input(:,:,:,:), h_output(:,:,:,:), h_target(:,:,:,:), h_grad(:,:,:,:)
+
+    ! Metrics
+    real(4) :: loss
+    integer :: step, i, j
+
+    print *, ""
+    print *, "================================================================"
+    print *, "  Simple Overfit Test (Refactored)"
+    print *, "================================================================"
+    print *, "Task: Learn to copy input to output (identity function)"
+    print *, "Data: One 64x64 constant image"
+    print *, ""
+
+    ! Initialize
+    stat = cudnnCreate(cudnn_handle)
+    ! Note: conv2d_init usually takes logical dimensions (N, C, H, W)
+    call conv2d_init(conv, cudnn_handle, 1, 1, 3, 1, 1, BATCH_SIZE, IMAGE_SIZE, IMAGE_SIZE, use_relu=.false.)
+
+    ! [FIX] Allocate with correct Fortran layout: (W, H, C, N)
+    allocate(input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(target(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(grad_output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(grad_input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+
+    allocate(h_input(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_output(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_target(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+    allocate(h_grad(IMAGE_SIZE, IMAGE_SIZE, 1, BATCH_SIZE))
+
+    ! Create simple data - constant image (value = 0.5)
+    h_input = 0.5
+    h_target = 0.5
+
+    input = h_input
+    target = h_target
+
+    print *, "Training..."
+    print '(A6, A15)', "Step", "Loss"
+    print *, "----------------------------------------------------------------"
+
+    do step = 1, NUM_STEPS
+        
+        ! [FIX] CRITICAL: Zero Gradients (Equivalent to optimizer.zero_grad())
+        ! Without this, gradients accumulate indefinitely!
+        conv%grad_weights = 0.0
+        conv%grad_bias = 0.0
+        
+        ! Forward
+        call conv2d_forward(conv, input, output)
+
+        ! Loss & gradient calculation
+        h_output = output
+        
+        ! MSE Loss: sum((y - t)^2) / N
+        loss = sum((h_output - h_target)**2) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+        
+        ! MSE Gradient: 2 * (y - t) / N
+        h_grad = 2.0 * (h_output - h_target) / (IMAGE_SIZE * IMAGE_SIZE * BATCH_SIZE)
+
+        grad_output = h_grad
+
+        ! Backward
+        ! Note: compute_grad_input=.false. because we don't need dL/dInput for the first layer
+        call conv2d_backward(conv, input, output, grad_output, grad_input, compute_grad_input=.false.)
+
+        ! Update (SGD)
+        ! We use a block to handle the update logic cleanly
+        block
+            real(4), allocatable :: w_temp(:,:,:,:), g_temp(:,:,:,:), b_temp(:), gb_temp(:)
+            
+            ! Shapes here depend on how conv2d_cudnn defines weights. 
+            ! Usually (OutC, InC, K, K) or similar. Using 'conv%weights' shape.
+            allocate(w_temp, source=conv%weights)
+            allocate(g_temp, source=conv%grad_weights)
+            allocate(b_temp, source=conv%bias)
+            allocate(gb_temp, source=conv%grad_bias)
+            
+            w_temp = conv%weights
+            g_temp = conv%grad_weights
+            b_temp = conv%bias
+            gb_temp = conv%grad_bias
+
+            ! Diagnostics for first few steps
+            if (step <= 3) then
+                 print *, "  Debug Step", step
+                 print *, "    Grad Mean:", sum(g_temp)/size(g_temp)
+                 print *, "    Bias Grad:", gb_temp(1)
+            end if
+
+            ! SGD Update: param = param - lr * grad
+            w_temp = w_temp - LEARNING_RATE * g_temp
+            b_temp = b_temp - LEARNING_RATE * gb_temp
+
+            conv%weights = w_temp
+            conv%bias = b_temp
+            
+            deallocate(w_temp, g_temp, b_temp, gb_temp)
+        end block
+
+        ! Synchronize
+        stat = cudaDeviceSynchronize()
+
+        ! Print loss
+        if (mod(step, 50) == 0 .or. step == 1) then
+            print '(I6, ES15.6)', step, loss
+        end if
+
+        ! Early stop
+        if (loss < 1.0e-6) then
+            print *, ""
+            print '(A, I0, A)', "Converged at step ", step, "!"
+            exit
+        end if
+    end do
+
+    print *, "----------------------------------------------------------------"
+
+    ! Final check
+    call conv2d_forward(conv, input, output)
+    h_output = output
+    loss = sum((h_output - h_target)**2) / (IMAGE_SIZE * IMAGE_SIZE)
+
+    print *, "Final results:"
+    print '(A, ES12.4)', "  Loss: ", loss
+    print '(A, F10.6)', "  Output mean: ", sum(h_output) / (IMAGE_SIZE * IMAGE_SIZE)
+
+    if (loss < 0.01) then
+        print *, "✓ SUCCESS: Network learned to copy constant image"
+    else
+        print *, "✗ FAIL: Could not learn simple constant"
+    end if
+    print *, ""
+
+    call conv2d_cleanup(conv)
+
+end program simple_overfit_test
