@@ -1,0 +1,16 @@
+12-Layer Deep Residual CNN Evaluation Results
+==================================================
+
+Model: saved_models/deep12/epoch_0005
+Parameters: 93,089
+
+Metrics:
+  Noisy PSNR:     12.81 dB
+  Denoised PSNR:  16.90 dB
+  PSNR Gain:      +4.09 dB
+
+  Noisy SSIM:     0.4843
+  Denoised SSIM:  0.4659
+  SSIM Gain:      +-0.0184
+
+  Edge Preservation: 55.9%

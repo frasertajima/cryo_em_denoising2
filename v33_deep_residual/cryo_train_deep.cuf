@@ -1,0 +1,529 @@
+!================================================================
+! Cryo-EM Denoising - 12-Layer Deep Residual CNN (v33)
+!================================================================
+! Deep residual CNN for cryo-EM particle denoising.
+! Uses residual learning: output = input - network(input)
+!
+! Architecture (12 layers, 32 channels):
+!   Conv1:  1 -> 32 channels, 3x3 kernel, ReLU
+!   Conv2-11: 32 -> 32 channels, 3x3 kernel, ReLU
+!   Conv12: 32 -> 1 channel, 3x3 kernel (no activation)
+!
+!   Output = Input - Conv12(Conv11(...(Conv1(Input))))
+!
+! Total parameters: ~93K
+!================================================================
+
+program cryo_train_deep
+    use cudafor
+    use iso_c_binding
+    use streaming_cryo_loader
+    use conv2d_cudnn
+    implicit none
+
+    ! cuDNN interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    ! Network architecture parameters
+    integer, parameter :: NUM_LAYERS = 12
+    integer, parameter :: HIDDEN_CHANNELS = 32
+    integer, parameter :: BATCH_SIZE = 1
+    integer, parameter :: IMG_SIZE = 1024
+    integer, parameter :: IN_CHANNELS = 1
+    integer, parameter :: OUT_CHANNELS = 1
+    integer, parameter :: KERNEL_SIZE = 3
+    integer, parameter :: PADDING = 1
+
+    ! Training parameters
+    integer :: num_epochs = 5
+    real(4) :: learning_rate = 0.001
+    integer :: max_batches = -1
+    logical :: save_checkpoints = .false.
+    character(len=256) :: checkpoint_dir = "saved_models/cryo_deep/"
+    character(len=256) :: data_dir = "../data/cryo_high_noise/"
+    real(4) :: val_split = 0.1
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+
+    ! CNN layers array (12 layers)
+    type(conv2d_layer_t) :: layers(NUM_LAYERS)
+
+    ! Data buffers - flat format from loader
+    real(4), managed, allocatable :: batch_noisy_flat(:,:)
+    real(4), managed, allocatable :: batch_clean_flat(:,:)
+
+    ! Data buffers - 4D format for CNN (W, H, C, N)
+    real(4), device, allocatable :: batch_input(:,:,:,:)
+    real(4), device, allocatable :: batch_target(:,:,:,:)
+
+    ! Store all activations for backward pass
+    ! h(:,:,:,:,i) = output of layer i (i=1..12)
+    real(4), device, allocatable :: h1(:,:,:,:)   ! After layer 1
+    real(4), device, allocatable :: h2(:,:,:,:)   ! After layer 2
+    real(4), device, allocatable :: h3(:,:,:,:)
+    real(4), device, allocatable :: h4(:,:,:,:)
+    real(4), device, allocatable :: h5(:,:,:,:)
+    real(4), device, allocatable :: h6(:,:,:,:)
+    real(4), device, allocatable :: h7(:,:,:,:)
+    real(4), device, allocatable :: h8(:,:,:,:)
+    real(4), device, allocatable :: h9(:,:,:,:)
+    real(4), device, allocatable :: h10(:,:,:,:)
+    real(4), device, allocatable :: h11(:,:,:,:)
+
+    ! Output (1 channel) - noise prediction
+    real(4), device, allocatable :: pred_noise(:,:,:,:)
+    real(4), device, allocatable :: output(:,:,:,:)
+
+    ! Gradients
+    real(4), device, allocatable :: grad_out(:,:,:,:)
+    real(4), device, allocatable :: grad_h(:,:,:,:)
+    real(4), device, allocatable :: grad_tmp(:,:,:,:)
+
+    ! Training state
+    integer :: epoch, batch_num, timestep
+    integer :: actual_batch_size, total_batches, train_batches, val_batches
+    real(4) :: batch_loss, epoch_loss, avg_loss
+    real(4) :: val_loss, val_avg_loss
+    real(4) :: epoch_start_time, epoch_end_time
+    integer :: samples_processed, val_samples_processed
+    integer :: istat, i
+    real(4) :: best_val_loss
+    integer :: total_params
+
+    ! Parse command line args
+    call parse_training_args()
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Cryo-EM CNN - v33 (12-Layer Deep Residual)"
+    print *, "=============================================="
+    print '(A,I8)', "  Layers:         ", NUM_LAYERS
+    print '(A,I8)', "  Hidden channels:", HIDDEN_CHANNELS
+    print '(A,I8)', "  Epochs:         ", num_epochs
+    print '(A,F10.6)', "  Learning rate:  ", learning_rate
+    print '(A,I8)', "  Batch size:     ", BATCH_SIZE
+    print '(A,I8)', "  Image size:     ", IMG_SIZE
+    print '(A,F6.1,A)', "  Val split:      ", val_split * 100, "%"
+    print '(A,A)', "  Data dir:       ", trim(data_dir)
+    if (save_checkpoints) then
+        print '(A,A)', "  Model saves:    ", trim(checkpoint_dir)
+    else
+        print *, "  Model saves:    disabled (use --save to enable)"
+    endif
+
+    ! Initialize cuDNN
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "  cuDNN initialized"
+
+    ! Initialize streaming data loader
+    call cryo_loader_init(trim(data_dir) // 'train_input.bin', &
+                          trim(data_dir) // 'train_target.bin', &
+                          10309, BATCH_SIZE)
+    print *, "  Streaming data loader initialized"
+
+    ! Initialize all 12 CNN layers
+    print *, "  Initializing 12-layer CNN..."
+
+    ! Layer 1: 1 -> 32 channels with ReLU
+    call conv2d_init(layers(1), cudnn_handle, IN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, BATCH_SIZE, IMG_SIZE, IMG_SIZE, .true.)
+
+    ! Layers 2-11: 32 -> 32 channels with ReLU
+    do i = 2, NUM_LAYERS - 1
+        call conv2d_init(layers(i), cudnn_handle, HIDDEN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, &
+                         PADDING, 1, BATCH_SIZE, IMG_SIZE, IMG_SIZE, .true.)
+    end do
+
+    ! Layer 12: 32 -> 1 channel (no activation - predicts noise)
+    call conv2d_init(layers(NUM_LAYERS), cudnn_handle, HIDDEN_CHANNELS, OUT_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, BATCH_SIZE, IMG_SIZE, IMG_SIZE, .false.)
+
+    total_params = (IN_CHANNELS * HIDDEN_CHANNELS * KERNEL_SIZE * KERNEL_SIZE + HIDDEN_CHANNELS) + &
+                   (NUM_LAYERS - 2) * (HIDDEN_CHANNELS * HIDDEN_CHANNELS * KERNEL_SIZE * KERNEL_SIZE + HIDDEN_CHANNELS) + &
+                   (HIDDEN_CHANNELS * OUT_CHANNELS * KERNEL_SIZE * KERNEL_SIZE + OUT_CHANNELS)
+    print '(A,I8)', "  Total parameters:", total_params
+    print *, "  CNN layers initialized"
+
+    ! Allocate buffers
+    print *, "  Allocating memory buffers..."
+    allocate(batch_noisy_flat(IMG_SIZE * IMG_SIZE, BATCH_SIZE))
+    allocate(batch_clean_flat(IMG_SIZE * IMG_SIZE, BATCH_SIZE))
+    allocate(batch_input(IMG_SIZE, IMG_SIZE, IN_CHANNELS, BATCH_SIZE))
+    allocate(batch_target(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+
+    ! Activation storage (11 hidden layers with 32 channels)
+    allocate(h1(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h2(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h3(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h4(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h5(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h6(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h7(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h8(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h9(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h10(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(h11(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+
+    allocate(pred_noise(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+    allocate(output(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+    allocate(grad_out(IMG_SIZE, IMG_SIZE, OUT_CHANNELS, BATCH_SIZE))
+    allocate(grad_h(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+    allocate(grad_tmp(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, BATCH_SIZE))
+
+    print *, "  Memory allocated"
+
+    total_batches = cryo_loader_get_num_batches()
+    timestep = 0
+
+    ! Split into train/val
+    val_batches = int(total_batches * val_split)
+    train_batches = total_batches - val_batches
+    best_val_loss = 1.0e10
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Starting Training"
+    print *, "=============================================="
+    print '(A,I8)', "  Total batches/epoch: ", total_batches
+    print '(A,I8)', "  Train batches:       ", train_batches
+    print '(A,I8)', "  Val batches:         ", val_batches
+    print *, ""
+
+    ! Training loop
+    do epoch = 1, num_epochs
+        call cpu_time(epoch_start_time)
+
+        call cryo_loader_start_epoch()
+        epoch_loss = 0.0
+        samples_processed = 0
+        batch_num = 0
+
+        ! === TRAINING PHASE ===
+        do
+            call cryo_loader_get_batch(batch_noisy_flat, batch_clean_flat, actual_batch_size)
+            if (actual_batch_size <= 0) exit
+
+            call reshape_flat_to_4d(batch_noisy_flat, batch_input, actual_batch_size)
+            call reshape_flat_to_4d(batch_clean_flat, batch_target, actual_batch_size)
+
+            batch_num = batch_num + 1
+            timestep = timestep + 1
+
+            if (max_batches > 0 .and. batch_num > max_batches) exit
+            if (batch_num > train_batches) exit
+
+            ! Forward pass
+            call conv2d_forward(layers(1), batch_input, h1)
+            call conv2d_forward(layers(2), h1, h2)
+            call conv2d_forward(layers(3), h2, h3)
+            call conv2d_forward(layers(4), h3, h4)
+            call conv2d_forward(layers(5), h4, h5)
+            call conv2d_forward(layers(6), h5, h6)
+            call conv2d_forward(layers(7), h6, h7)
+            call conv2d_forward(layers(8), h7, h8)
+            call conv2d_forward(layers(9), h8, h9)
+            call conv2d_forward(layers(10), h9, h10)
+            call conv2d_forward(layers(11), h10, h11)
+            call conv2d_forward(layers(12), h11, pred_noise)
+
+            ! Residual: output = input - pred_noise
+            call apply_residual(batch_input, pred_noise, output, actual_batch_size)
+
+            ! Compute MSE loss
+            call compute_mse_loss(output, batch_target, grad_out, actual_batch_size, batch_loss)
+
+            ! Residual backward: negate gradient for noise prediction
+            call negate_array(grad_out, actual_batch_size)
+
+            ! Backward pass
+            call conv2d_backward(layers(12), h11, pred_noise, grad_out, grad_h)
+            call conv2d_backward(layers(11), h10, h11, grad_h, grad_tmp)
+            call conv2d_backward(layers(10), h9, h10, grad_tmp, grad_h)
+            call conv2d_backward(layers(9), h8, h9, grad_h, grad_tmp)
+            call conv2d_backward(layers(8), h7, h8, grad_tmp, grad_h)
+            call conv2d_backward(layers(7), h6, h7, grad_h, grad_tmp)
+            call conv2d_backward(layers(6), h5, h6, grad_tmp, grad_h)
+            call conv2d_backward(layers(5), h4, h5, grad_h, grad_tmp)
+            call conv2d_backward(layers(4), h3, h4, grad_tmp, grad_h)
+            call conv2d_backward(layers(3), h2, h3, grad_h, grad_tmp)
+            call conv2d_backward(layers(2), h1, h2, grad_tmp, grad_h)
+            call conv2d_backward(layers(1), batch_input, h1, grad_h, grad_tmp, .false.)
+
+            ! Update weights
+            do i = 1, NUM_LAYERS
+                call conv2d_update(layers(i), learning_rate, timestep)
+            end do
+
+            epoch_loss = epoch_loss + batch_loss
+            samples_processed = samples_processed + 1
+
+            if (mod(batch_num, 1000) == 0 .or. batch_num <= 5) then
+                print '(A,I2,A,I5,A,I5,A,F10.6,A,F8.4)', &
+                    "  Epoch ", epoch, " | Batch ", batch_num, "/", train_batches, &
+                    " | Loss: ", epoch_loss / samples_processed, &
+                    " | RMSE: ", sqrt(epoch_loss / samples_processed)
+            endif
+        end do
+
+        print '(A,I5,A)', "  Processed ", samples_processed, " training batches"
+        avg_loss = epoch_loss / samples_processed
+
+        ! === VALIDATION PHASE ===
+        val_loss = 0.0
+        val_samples_processed = 0
+
+        if (max_batches > 0) then
+            val_avg_loss = avg_loss
+            goto 100
+        endif
+
+        do while (batch_num <= total_batches)
+            call cryo_loader_get_batch(batch_noisy_flat, batch_clean_flat, actual_batch_size)
+            if (actual_batch_size <= 0) exit
+
+            call reshape_flat_to_4d(batch_noisy_flat, batch_input, actual_batch_size)
+            call reshape_flat_to_4d(batch_clean_flat, batch_target, actual_batch_size)
+
+            batch_num = batch_num + 1
+
+            ! Forward only
+            call conv2d_forward(layers(1), batch_input, h1)
+            call conv2d_forward(layers(2), h1, h2)
+            call conv2d_forward(layers(3), h2, h3)
+            call conv2d_forward(layers(4), h3, h4)
+            call conv2d_forward(layers(5), h4, h5)
+            call conv2d_forward(layers(6), h5, h6)
+            call conv2d_forward(layers(7), h6, h7)
+            call conv2d_forward(layers(8), h7, h8)
+            call conv2d_forward(layers(9), h8, h9)
+            call conv2d_forward(layers(10), h9, h10)
+            call conv2d_forward(layers(11), h10, h11)
+            call conv2d_forward(layers(12), h11, pred_noise)
+            call apply_residual(batch_input, pred_noise, output, actual_batch_size)
+            call compute_mse_loss(output, batch_target, grad_out, actual_batch_size, batch_loss)
+
+            val_loss = val_loss + batch_loss
+            val_samples_processed = val_samples_processed + 1
+        end do
+
+        if (val_samples_processed > 0) then
+            val_avg_loss = val_loss / val_samples_processed
+        else
+            val_avg_loss = 0.0
+        endif
+
+        call cpu_time(epoch_end_time)
+
+100     continue
+
+        print *, ""
+        print '(A,I2,A)', "  ===== Epoch ", epoch, " Complete ====="
+        print '(A,F10.6)', "  Train Loss: ", avg_loss
+        print '(A,F10.6)', "  Train RMSE: ", sqrt(avg_loss)
+        if (val_samples_processed > 0) then
+            print '(A,F10.6)', "  Val Loss:   ", val_avg_loss
+            print '(A,F10.6)', "  Val RMSE:   ", sqrt(val_avg_loss)
+        endif
+
+        if (save_checkpoints) then
+            if (val_avg_loss < best_val_loss) then
+                best_val_loss = val_avg_loss
+                print *, "  New best model! Saving checkpoint..."
+                call save_model_checkpoint(epoch, val_avg_loss)
+            else
+                print '(A,F10.6)', "  Best val loss: ", best_val_loss
+            endif
+        endif
+        print *, ""
+
+    end do
+
+    print *, "=============================================="
+    print *, "  Training Complete"
+    print *, "=============================================="
+    print '(A,F10.6)', "  Final Val Loss: ", val_avg_loss
+    print '(A,F10.6)', "  Final Val RMSE: ", sqrt(val_avg_loss)
+    print *, ""
+
+    ! Cleanup
+    deallocate(batch_noisy_flat, batch_clean_flat)
+    deallocate(batch_input, batch_target)
+    deallocate(h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11)
+    deallocate(pred_noise, output, grad_out, grad_h, grad_tmp)
+    do i = 1, NUM_LAYERS
+        call conv2d_cleanup(layers(i))
+    end do
+    call cryo_loader_cleanup()
+    istat = cudnnDestroy(cudnn_handle)
+
+contains
+
+    subroutine apply_residual(input, noise, out, batch_size)
+        real(4), device, intent(in) :: input(:,:,:,:), noise(:,:,:,:)
+        real(4), device, intent(out) :: out(:,:,:,:)
+        integer, intent(in) :: batch_size
+        integer :: b, h, w
+
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do h = 1, IMG_SIZE
+                do w = 1, IMG_SIZE
+                    out(w, h, 1, b) = input(w, h, 1, b) - noise(w, h, 1, b)
+                end do
+            end do
+        end do
+    end subroutine
+
+    subroutine negate_array(arr, batch_size)
+        real(4), device, intent(inout) :: arr(:,:,:,:)
+        integer, intent(in) :: batch_size
+        integer :: b, h, w
+
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do h = 1, IMG_SIZE
+                do w = 1, IMG_SIZE
+                    arr(w, h, 1, b) = -arr(w, h, 1, b)
+                end do
+            end do
+        end do
+    end subroutine
+
+    subroutine reshape_flat_to_4d(flat, tensor_4d, batch_size)
+        real(4), managed, intent(in) :: flat(:,:)
+        real(4), device, intent(out) :: tensor_4d(:,:,:,:)
+        integer, intent(in) :: batch_size
+        integer :: b, idx, w, h
+
+        !$cuf kernel do(2) <<< *, * >>>
+        do b = 1, batch_size
+            do idx = 1, IMG_SIZE * IMG_SIZE
+                h = (idx - 1) / IMG_SIZE + 1
+                w = mod(idx - 1, IMG_SIZE) + 1
+                tensor_4d(w, h, 1, b) = flat(idx, b)
+            end do
+        end do
+    end subroutine
+
+    subroutine compute_mse_loss(pred, target, grad, batch_size, loss)
+        real(4), device, intent(in) :: pred(:,:,:,:), target(:,:,:,:)
+        real(4), device, intent(out) :: grad(:,:,:,:)
+        integer, intent(in) :: batch_size
+        real(4), intent(out) :: loss
+        real(4) :: scale
+        integer :: b, c, h, w, total_elements, wd, ht, ch
+        real(4), allocatable :: h_pred(:,:,:,:), h_tgt(:,:,:,:)
+
+        wd = size(pred, 1); ht = size(pred, 2); ch = size(pred, 3)
+        total_elements = batch_size * ch * ht * wd
+        scale = 2.0 / real(total_elements)
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, batch_size
+            do c = 1, ch
+                do h = 1, ht
+                    do w = 1, wd
+                        grad(w, h, c, b) = scale * (pred(w, h, c, b) - target(w, h, c, b))
+                    end do
+                end do
+            end do
+        end do
+
+        allocate(h_pred(wd, ht, ch, batch_size), h_tgt(wd, ht, ch, batch_size))
+        h_pred = pred(:,:,:,1:batch_size); h_tgt = target(:,:,:,1:batch_size)
+        istat = cudaDeviceSynchronize()
+        loss = sum((h_pred - h_tgt)**2) / real(total_elements)
+        deallocate(h_pred, h_tgt)
+    end subroutine
+
+    subroutine save_model_checkpoint(epoch_num, val_loss_value)
+        integer, intent(in) :: epoch_num
+        real(4), intent(in) :: val_loss_value
+        character(len=256) :: epoch_dir, filename
+        integer :: unit_num, j
+
+        write(epoch_dir, '(A,A,I4.4,A)') trim(checkpoint_dir), 'epoch_', epoch_num, '/'
+        call system("mkdir -p " // trim(epoch_dir))
+
+        write(filename, '(A,A)') trim(epoch_dir), 'loss.txt'
+        open(newunit=unit_num, file=trim(filename), status='replace')
+        write(unit_num, '(F12.8)') val_loss_value
+        close(unit_num)
+
+        do j = 1, NUM_LAYERS
+            write(filename, '(A,A,I2.2,A)') trim(epoch_dir), 'conv', j, '_'
+            call save_layer_weights(layers(j), trim(filename))
+        end do
+    end subroutine
+
+    subroutine save_layer_weights(layer, prefix)
+        type(conv2d_layer_t), intent(in) :: layer
+        character(len=*), intent(in) :: prefix
+        real(4), allocatable :: h_weights(:,:,:,:), h_bias(:)
+        integer :: unit_num
+
+        allocate(h_weights(layer%out_channels, layer%in_channels, layer%kernel_size, layer%kernel_size))
+        allocate(h_bias(layer%out_channels))
+        h_weights = layer%weights; h_bias = layer%bias
+        istat = cudaDeviceSynchronize()
+
+        open(newunit=unit_num, file=trim(prefix)//'weights.bin', status='replace', access='stream', form='unformatted')
+        write(unit_num) h_weights
+        close(unit_num)
+
+        open(newunit=unit_num, file=trim(prefix)//'bias.bin', status='replace', access='stream', form='unformatted')
+        write(unit_num) h_bias
+        close(unit_num)
+
+        deallocate(h_weights, h_bias)
+    end subroutine
+
+    subroutine parse_training_args()
+        character(len=256) :: arg
+        integer :: ii, num_args
+
+        num_args = command_argument_count()
+        ii = 1
+        do while (ii <= num_args)
+            call get_command_argument(ii, arg)
+
+            if (trim(arg) == '--epochs') then
+                ii = ii + 1; call get_command_argument(ii, arg); read(arg, *) num_epochs
+            else if (trim(arg) == '--lr') then
+                ii = ii + 1; call get_command_argument(ii, arg); read(arg, *) learning_rate
+            else if (trim(arg) == '--max_batches') then
+                ii = ii + 1; call get_command_argument(ii, arg); read(arg, *) max_batches
+            else if (trim(arg) == '--save') then
+                save_checkpoints = .true.
+            else if (trim(arg) == '--checkpoint_dir') then
+                ii = ii + 1; call get_command_argument(ii, arg); checkpoint_dir = trim(arg) // "/"
+            else if (trim(arg) == '--data_dir') then
+                ii = ii + 1; call get_command_argument(ii, arg); data_dir = trim(arg) // "/"
+            else if (trim(arg) == '--val_split') then
+                ii = ii + 1; call get_command_argument(ii, arg); read(arg, *) val_split
+            else if (trim(arg) == '--stream') then
+                continue
+            endif
+            ii = ii + 1
+        end do
+
+        if (save_checkpoints) call system("mkdir -p " // trim(checkpoint_dir))
+    end subroutine
+
+end program cryo_train_deep

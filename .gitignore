@@ -1,7 +1,7 @@
 # Large datasets - DO NOT COMMIT
 data/cryo_data_streaming/
+data/cryo_high_noise/
 data/empiar_*/
-*.bin
 *.mrc
 
 # Compiled binaries and object files
@@ -9,6 +9,8 @@ data/empiar_*/
 *.mod
 *.exe
 cryo_train
+cryo_train_deep
+cryo_train_perceptual
 test_*
 !test_*.py
 !test_*.cuf
@@ -18,8 +20,17 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Saved models (large checkpoint files)
+# Large saved models (but keep final model weights)
 saved_models/
+v28f_*/saved_models/
+v29_*/saved_models/
+v30_*/saved_models/
+v31_*/saved_models/
+
+# Keep the final trained 12-layer model
+!v33_deep_residual/saved_models/
+!v33_deep_residual/saved_models/deep12/
+!v33_deep_residual/saved_models/deep12/epoch_0005/
 
 # IDE
 .vscode/
@@ -31,8 +42,21 @@ saved_models/
 .DS_Store
 Thumbs.db
 
-# Large images
-*.png
-
 # Logs
 *.log
+nohup.out
+
+# Temporary files
+training.log
+preprocess*.log
+
+# Large binary outputs (not model weights)
+denoised_output.bin
+
+# Large images (keep evaluation results though)
+raw_mrc_comparison.png
+visualization_samples.png
+v31_perceptual_loss/*.png
+
+# Intermediate experiment results
+v29_fourier_loss/results/
