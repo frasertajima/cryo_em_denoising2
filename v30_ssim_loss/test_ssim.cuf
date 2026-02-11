@@ -1,0 +1,113 @@
+!================================================================
+! Test SSIM Loss Module
+!================================================================
+program test_ssim
+    use cudafor
+    use ssim_loss_module
+    implicit none
+
+    integer, parameter :: WIDTH = 64
+    integer, parameter :: HEIGHT = 64
+    integer, parameter :: BATCH_SIZE = 2
+
+    real(4), device, allocatable :: d_img1(:,:,:,:)
+    real(4), device, allocatable :: d_img2(:,:,:,:)
+    real(4) :: loss
+    integer :: i, j, b
+
+    print *, "========================================"
+    print *, "Test SSIM Loss Module"
+    print *, "========================================"
+    print *, ""
+
+    ! Initialize SSIM module
+    call init_ssim_loss(WIDTH, HEIGHT, BATCH_SIZE)
+
+    ! Allocate test images
+    allocate(d_img1(WIDTH, HEIGHT, 1, BATCH_SIZE))
+    allocate(d_img2(WIDTH, HEIGHT, 1, BATCH_SIZE))
+
+    ! Test 1: Identical images (SSIM should be 1, loss should be 0)
+    print *, "Test 1: Identical images (constant 0.5)"
+    !$cuf kernel do(3) <<< *, * >>>
+    do b = 1, BATCH_SIZE
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                d_img1(i, j, 1, b) = 0.5
+                d_img2(i, j, 1, b) = 0.5
+            end do
+        end do
+    end do
+
+    call compute_ssim_loss(d_img1, d_img2, BATCH_SIZE, loss)
+    print '(A,F10.6)', "  SSIM Loss: ", loss
+    if (abs(loss) < 0.01) then
+        print *, "  PASS: Loss is near zero for identical images"
+    else
+        print *, "  WARNING: Expected ~0 loss for identical images"
+    endif
+    print *, ""
+
+    ! Test 2: Slightly different images
+    print *, "Test 2: Small difference (noise sigma=0.1)"
+    !$cuf kernel do(3) <<< *, * >>>
+    do b = 1, BATCH_SIZE
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                d_img1(i, j, 1, b) = 0.5
+                d_img2(i, j, 1, b) = 0.5 + 0.1 * sin(real(i + j * 10))
+            end do
+        end do
+    end do
+
+    call compute_ssim_loss(d_img1, d_img2, BATCH_SIZE, loss)
+    print '(A,F10.6)', "  SSIM Loss: ", loss
+    print '(A,F10.6)', "  SSIM value: ", 1.0 - loss
+    print *, ""
+
+    ! Test 3: Very different images
+    print *, "Test 3: Large difference (inverted)"
+    !$cuf kernel do(3) <<< *, * >>>
+    do b = 1, BATCH_SIZE
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                d_img1(i, j, 1, b) = real(i) / real(WIDTH)
+                d_img2(i, j, 1, b) = 1.0 - real(i) / real(WIDTH)
+            end do
+        end do
+    end do
+
+    call compute_ssim_loss(d_img1, d_img2, BATCH_SIZE, loss)
+    print '(A,F10.6)', "  SSIM Loss: ", loss
+    print '(A,F10.6)', "  SSIM value: ", 1.0 - loss
+    if (loss > 0.5) then
+        print *, "  PASS: High loss for very different images"
+    endif
+    print *, ""
+
+    ! Test 4: Gradient pattern
+    print *, "Test 4: Horizontal vs vertical gradient"
+    !$cuf kernel do(3) <<< *, * >>>
+    do b = 1, BATCH_SIZE
+        do j = 1, HEIGHT
+            do i = 1, WIDTH
+                d_img1(i, j, 1, b) = real(i) / real(WIDTH)  ! Horizontal gradient
+                d_img2(i, j, 1, b) = real(j) / real(HEIGHT) ! Vertical gradient
+            end do
+        end do
+    end do
+
+    call compute_ssim_loss(d_img1, d_img2, BATCH_SIZE, loss)
+    print '(A,F10.6)', "  SSIM Loss: ", loss
+    print '(A,F10.6)', "  SSIM value: ", 1.0 - loss
+    print *, ""
+
+    ! Cleanup
+    deallocate(d_img1, d_img2)
+    call destroy_ssim_loss()
+
+    print *, "========================================"
+    print *, "All tests completed!"
+    print *, "========================================"
+
+end program test_ssim

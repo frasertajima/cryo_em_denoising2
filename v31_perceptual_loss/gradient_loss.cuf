@@ -1,0 +1,159 @@
+!================================================================
+! Gradient Loss Module for Cryo-EM Denoising
+!================================================================
+! Edge-preserving loss that penalizes differences in image gradients.
+!
+! Computes Sobel gradients in X and Y directions for both
+! prediction and target, then measures the L1 difference.
+!
+! This encourages the network to preserve edge sharpness
+! and structural details that pixel-wise MSE may blur.
+!
+! Loss = mean(|grad_x(pred) - grad_x(target)|) +
+!        mean(|grad_y(pred) - grad_y(target)|)
+!================================================================
+
+module gradient_loss_module
+    use cudafor
+    implicit none
+
+    ! Module state
+    integer, save :: grad_width = 0
+    integer, save :: grad_height = 0
+    integer, save :: grad_batch = 0
+
+    ! Work buffers for gradients
+    real(4), device, allocatable, save :: d_grad_x_pred(:,:,:,:)
+    real(4), device, allocatable, save :: d_grad_y_pred(:,:,:,:)
+    real(4), device, allocatable, save :: d_grad_x_target(:,:,:,:)
+    real(4), device, allocatable, save :: d_grad_y_target(:,:,:,:)
+    real(4), device, allocatable, save :: d_diff(:,:,:,:)
+
+    ! Host buffer for reduction
+    real(4), allocatable, save :: h_diff(:,:,:,:)
+
+contains
+
+    !----------------------------------------
+    ! Initialize gradient loss module
+    !----------------------------------------
+    subroutine init_gradient_loss(width, height, batch_size)
+        integer, intent(in) :: width, height, batch_size
+
+        grad_width = width
+        grad_height = height
+        grad_batch = batch_size
+
+        ! Allocate work buffers
+        allocate(d_grad_x_pred(width, height, 1, batch_size))
+        allocate(d_grad_y_pred(width, height, 1, batch_size))
+        allocate(d_grad_x_target(width, height, 1, batch_size))
+        allocate(d_grad_y_target(width, height, 1, batch_size))
+        allocate(d_diff(width, height, 1, batch_size))
+        allocate(h_diff(width, height, 1, batch_size))
+
+    end subroutine init_gradient_loss
+
+    !----------------------------------------
+    ! Compute Sobel gradients using CUDA kernel
+    !----------------------------------------
+    subroutine compute_sobel_gradients(input, grad_x, grad_y, width, height, batch_size)
+        real(4), device, intent(in) :: input(:,:,:,:)
+        real(4), device, intent(out) :: grad_x(:,:,:,:)
+        real(4), device, intent(out) :: grad_y(:,:,:,:)
+        integer, intent(in) :: width, height, batch_size
+
+        integer :: i, j, b
+        integer :: im1, ip1, jm1, jp1
+        real(4) :: gx, gy
+
+        ! Sobel kernels:
+        ! Gx = [-1 0 1]     Gy = [-1 -2 -1]
+        !      [-2 0 2]          [ 0  0  0]
+        !      [-1 0 1]          [ 1  2  1]
+
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do j = 1, height
+                do i = 1, width
+                    ! Clamp indices to valid range
+                    im1 = max(1, i - 1)
+                    ip1 = min(width, i + 1)
+                    jm1 = max(1, j - 1)
+                    jp1 = min(height, j + 1)
+
+                    ! Sobel X gradient
+                    gx = -input(im1, jm1, 1, b) + input(ip1, jm1, 1, b) &
+                       - 2.0*input(im1, j, 1, b) + 2.0*input(ip1, j, 1, b) &
+                       - input(im1, jp1, 1, b) + input(ip1, jp1, 1, b)
+
+                    ! Sobel Y gradient
+                    gy = -input(im1, jm1, 1, b) - 2.0*input(i, jm1, 1, b) - input(ip1, jm1, 1, b) &
+                       + input(im1, jp1, 1, b) + 2.0*input(i, jp1, 1, b) + input(ip1, jp1, 1, b)
+
+                    grad_x(i, j, 1, b) = gx
+                    grad_y(i, j, 1, b) = gy
+                end do
+            end do
+        end do
+
+    end subroutine compute_sobel_gradients
+
+    !----------------------------------------
+    ! Compute gradient loss for a batch
+    !----------------------------------------
+    subroutine compute_gradient_loss(pred, target, batch_size, loss)
+        real(4), device, intent(in) :: pred(:,:,:,:)    ! (W, H, 1, N)
+        real(4), device, intent(in) :: target(:,:,:,:)  ! (W, H, 1, N)
+        integer, intent(in) :: batch_size
+        real(4), intent(out) :: loss
+
+        integer :: i, j, b, istat
+        real(4) :: sum_diff
+
+        ! Compute Sobel gradients for prediction
+        call compute_sobel_gradients(pred, d_grad_x_pred, d_grad_y_pred, &
+                                     grad_width, grad_height, batch_size)
+
+        ! Compute Sobel gradients for target
+        call compute_sobel_gradients(target, d_grad_x_target, d_grad_y_target, &
+                                     grad_width, grad_height, batch_size)
+
+        ! Compute L1 difference of gradients
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do j = 1, grad_height
+                do i = 1, grad_width
+                    d_diff(i, j, 1, b) = abs(d_grad_x_pred(i, j, 1, b) - d_grad_x_target(i, j, 1, b)) &
+                                       + abs(d_grad_y_pred(i, j, 1, b) - d_grad_y_target(i, j, 1, b))
+                end do
+            end do
+        end do
+
+        istat = cudaDeviceSynchronize()
+
+        ! Compute mean loss
+        h_diff = d_diff(:, :, :, 1:batch_size)
+        sum_diff = sum(h_diff)
+        loss = sum_diff / real(grad_width * grad_height * batch_size)
+
+    end subroutine compute_gradient_loss
+
+    !----------------------------------------
+    ! Cleanup
+    !----------------------------------------
+    subroutine destroy_gradient_loss()
+
+        if (allocated(d_grad_x_pred)) deallocate(d_grad_x_pred)
+        if (allocated(d_grad_y_pred)) deallocate(d_grad_y_pred)
+        if (allocated(d_grad_x_target)) deallocate(d_grad_x_target)
+        if (allocated(d_grad_y_target)) deallocate(d_grad_y_target)
+        if (allocated(d_diff)) deallocate(d_diff)
+        if (allocated(h_diff)) deallocate(h_diff)
+
+        grad_width = 0
+        grad_height = 0
+
+    end subroutine destroy_gradient_loss
+
+end module gradient_loss_module

@@ -1,0 +1,282 @@
+!================================================================
+! SSIM Loss Module for Cryo-EM Denoising
+!================================================================
+! Structural Similarity Index (SSIM) loss using CUDA kernels.
+!
+! SSIM measures perceptual quality by comparing:
+!   - Luminance (local means)
+!   - Contrast (local variances)
+!   - Structure (local covariance)
+!
+! Formula:
+!   SSIM(x,y) = (2*mu_x*mu_y + C1)(2*sigma_xy + C2) /
+!               (mu_x^2 + mu_y^2 + C1)(sigma_x^2 + sigma_y^2 + C2)
+!
+! Loss = 1 - SSIM (so minimizing loss maximizes SSIM)
+!
+! Uses CUDA kernels for Gaussian-weighted local statistics.
+!================================================================
+
+module ssim_loss_module
+    use cudafor
+    implicit none
+
+    ! SSIM constants
+    real(4), parameter :: SSIM_C1 = 0.01**2  ! (K1*L)^2 where K1=0.01, L=1 for normalized images
+    real(4), parameter :: SSIM_C2 = 0.03**2  ! (K2*L)^2 where K2=0.03
+    integer, parameter :: WINDOW_SIZE = 11   ! Standard SSIM window size
+
+    ! Module state
+    integer, save :: ssim_width = 0
+    integer, save :: ssim_height = 0
+    integer, save :: ssim_batch = 0
+
+    ! Gaussian kernel (11x11)
+    real(4), device, allocatable, save :: d_gaussian(:,:,:,:)
+
+    ! Work buffers
+    real(4), device, allocatable, save :: d_mu_x(:,:,:,:)
+    real(4), device, allocatable, save :: d_mu_y(:,:,:,:)
+    real(4), device, allocatable, save :: d_sigma_x2(:,:,:,:)
+    real(4), device, allocatable, save :: d_sigma_y2(:,:,:,:)
+    real(4), device, allocatable, save :: d_sigma_xy(:,:,:,:)
+    real(4), device, allocatable, save :: d_x2(:,:,:,:)
+    real(4), device, allocatable, save :: d_y2(:,:,:,:)
+    real(4), device, allocatable, save :: d_xy(:,:,:,:)
+    real(4), device, allocatable, save :: d_ssim_map(:,:,:,:)
+
+    ! Host buffer for loss reduction
+    real(4), allocatable, save :: h_ssim_map(:,:,:,:)
+
+contains
+
+    !----------------------------------------
+    ! Create Gaussian kernel for SSIM
+    !----------------------------------------
+    subroutine create_gaussian_kernel(kernel, size, sigma)
+        real(4), intent(out) :: kernel(:,:)
+        integer, intent(in) :: size
+        real(4), intent(in) :: sigma
+
+        integer :: i, j, center
+        real(4) :: x, y, sum_val
+
+        center = size / 2 + 1
+        sum_val = 0.0
+
+        do j = 1, size
+            do i = 1, size
+                x = real(i - center)
+                y = real(j - center)
+                kernel(i, j) = exp(-(x*x + y*y) / (2.0 * sigma * sigma))
+                sum_val = sum_val + kernel(i, j)
+            end do
+        end do
+
+        ! Normalize
+        kernel = kernel / sum_val
+
+    end subroutine create_gaussian_kernel
+
+    !----------------------------------------
+    ! Initialize SSIM loss module
+    !----------------------------------------
+    subroutine init_ssim_loss(width, height, batch_size)
+        integer, intent(in) :: width, height, batch_size
+
+        real(4) :: h_gaussian(WINDOW_SIZE, WINDOW_SIZE)
+        real(4) :: sigma
+
+        ssim_width = width
+        ssim_height = height
+        ssim_batch = batch_size
+
+        ! Create Gaussian kernel (sigma = 1.5 is standard for 11x11)
+        sigma = 1.5
+        call create_gaussian_kernel(h_gaussian, WINDOW_SIZE, sigma)
+
+        ! Allocate and copy Gaussian kernel (format: out_ch, in_ch, kH, kW)
+        allocate(d_gaussian(1, 1, WINDOW_SIZE, WINDOW_SIZE))
+        d_gaussian(1, 1, :, :) = h_gaussian
+
+        ! Allocate work buffers
+        allocate(d_mu_x(width, height, 1, batch_size))
+        allocate(d_mu_y(width, height, 1, batch_size))
+        allocate(d_sigma_x2(width, height, 1, batch_size))
+        allocate(d_sigma_y2(width, height, 1, batch_size))
+        allocate(d_sigma_xy(width, height, 1, batch_size))
+        allocate(d_x2(width, height, 1, batch_size))
+        allocate(d_y2(width, height, 1, batch_size))
+        allocate(d_xy(width, height, 1, batch_size))
+        allocate(d_ssim_map(width, height, 1, batch_size))
+        allocate(h_ssim_map(width, height, 1, batch_size))
+
+    end subroutine init_ssim_loss
+
+    !----------------------------------------
+    ! Apply Gaussian blur using CUDA kernel
+    !----------------------------------------
+    subroutine gaussian_blur(input, output, batch_size)
+        real(4), device, intent(in) :: input(:,:,:,:)
+        real(4), device, intent(out) :: output(:,:,:,:)
+        integer, intent(in) :: batch_size
+
+        call gaussian_blur_kernel(input, output, d_gaussian, &
+                                  ssim_width, ssim_height, batch_size, WINDOW_SIZE)
+
+    end subroutine gaussian_blur
+
+    !----------------------------------------
+    ! CUDA kernel for Gaussian blur
+    !----------------------------------------
+    subroutine gaussian_blur_kernel(input, output, kernel, width, height, batch_size, ksize)
+        real(4), device, intent(in) :: input(:,:,:,:)
+        real(4), device, intent(out) :: output(:,:,:,:)
+        real(4), device, intent(in) :: kernel(:,:,:,:)
+        integer, intent(in) :: width, height, batch_size, ksize
+
+        integer :: i, j, b, ki, kj
+        integer :: pad, ii, jj
+        real(4) :: sum_val, kval
+
+        pad = ksize / 2
+
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do j = 1, height
+                do i = 1, width
+                    sum_val = 0.0
+                    do kj = 1, ksize
+                        do ki = 1, ksize
+                            ii = i + ki - pad - 1
+                            jj = j + kj - pad - 1
+                            ! Clamp to edges
+                            if (ii < 1) ii = 1
+                            if (ii > width) ii = width
+                            if (jj < 1) jj = 1
+                            if (jj > height) jj = height
+                            kval = kernel(1, 1, ki, kj)
+                            sum_val = sum_val + input(ii, jj, 1, b) * kval
+                        end do
+                    end do
+                    output(i, j, 1, b) = sum_val
+                end do
+            end do
+        end do
+
+    end subroutine gaussian_blur_kernel
+
+    !----------------------------------------
+    ! Compute SSIM loss for a batch
+    !----------------------------------------
+    subroutine compute_ssim_loss(pred, target, batch_size, loss)
+        real(4), device, intent(in) :: pred(:,:,:,:)    ! (W, H, 1, N)
+        real(4), device, intent(in) :: target(:,:,:,:)  ! (W, H, 1, N)
+        integer, intent(in) :: batch_size
+        real(4), intent(out) :: loss
+
+        integer :: i, j, b, istat
+        real(4) :: ssim_sum
+
+        ! Step 1: Compute x^2, y^2, x*y
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do j = 1, ssim_height
+                do i = 1, ssim_width
+                    d_x2(i, j, 1, b) = pred(i, j, 1, b) * pred(i, j, 1, b)
+                    d_y2(i, j, 1, b) = target(i, j, 1, b) * target(i, j, 1, b)
+                    d_xy(i, j, 1, b) = pred(i, j, 1, b) * target(i, j, 1, b)
+                end do
+            end do
+        end do
+
+        ! Step 2: Gaussian blur to get local means
+        call gaussian_blur(pred, d_mu_x, batch_size)
+        call gaussian_blur(target, d_mu_y, batch_size)
+
+        ! Step 3: Gaussian blur of squares/products
+        call gaussian_blur(d_x2, d_sigma_x2, batch_size)
+        call gaussian_blur(d_y2, d_sigma_y2, batch_size)
+        call gaussian_blur(d_xy, d_sigma_xy, batch_size)
+
+        ! Step 4: Compute SSIM map
+        ! sigma_x^2 = E[x^2] - E[x]^2
+        ! sigma_y^2 = E[y^2] - E[y]^2
+        ! sigma_xy = E[xy] - E[x]*E[y]
+        call compute_ssim_map_kernel(d_mu_x, d_mu_y, d_sigma_x2, d_sigma_y2, d_sigma_xy, &
+                                     d_ssim_map, ssim_width, ssim_height, batch_size)
+
+        istat = cudaDeviceSynchronize()
+
+        ! Step 5: Compute mean SSIM and convert to loss
+        h_ssim_map = d_ssim_map(:, :, :, 1:batch_size)
+        ssim_sum = sum(h_ssim_map)
+
+        ! Loss = 1 - mean_SSIM (so lower loss = higher SSIM = better)
+        loss = 1.0 - ssim_sum / real(ssim_width * ssim_height * batch_size)
+
+    end subroutine compute_ssim_loss
+
+    !----------------------------------------
+    ! Cleanup
+    !----------------------------------------
+    subroutine destroy_ssim_loss()
+
+        if (allocated(d_gaussian)) deallocate(d_gaussian)
+        if (allocated(d_mu_x)) deallocate(d_mu_x)
+        if (allocated(d_mu_y)) deallocate(d_mu_y)
+        if (allocated(d_sigma_x2)) deallocate(d_sigma_x2)
+        if (allocated(d_sigma_y2)) deallocate(d_sigma_y2)
+        if (allocated(d_sigma_xy)) deallocate(d_sigma_xy)
+        if (allocated(d_x2)) deallocate(d_x2)
+        if (allocated(d_y2)) deallocate(d_y2)
+        if (allocated(d_xy)) deallocate(d_xy)
+        if (allocated(d_ssim_map)) deallocate(d_ssim_map)
+        if (allocated(h_ssim_map)) deallocate(h_ssim_map)
+
+        ssim_width = 0
+        ssim_height = 0
+
+    end subroutine destroy_ssim_loss
+
+    !----------------------------------------
+    ! Kernel to compute SSIM map (separate to avoid BLOCK in parallel)
+    !----------------------------------------
+    subroutine compute_ssim_map_kernel(mu_x, mu_y, sigma_x2, sigma_y2, sigma_xy, &
+                                       ssim_map, width, height, batch_size)
+        real(4), device, intent(in) :: mu_x(:,:,:,:)
+        real(4), device, intent(in) :: mu_y(:,:,:,:)
+        real(4), device, intent(in) :: sigma_x2(:,:,:,:)
+        real(4), device, intent(in) :: sigma_y2(:,:,:,:)
+        real(4), device, intent(in) :: sigma_xy(:,:,:,:)
+        real(4), device, intent(out) :: ssim_map(:,:,:,:)
+        integer, intent(in) :: width, height, batch_size
+
+        integer :: i, j, b
+        real(4) :: mx, my, mx2, my2, sx2, sy2, sxy, num, denom
+
+        !$cuf kernel do(3) <<< *, * >>>
+        do b = 1, batch_size
+            do j = 1, height
+                do i = 1, width
+                    mx = mu_x(i, j, 1, b)
+                    my = mu_y(i, j, 1, b)
+                    mx2 = mx * mx
+                    my2 = my * my
+
+                    sx2 = sigma_x2(i, j, 1, b) - mx2
+                    sy2 = sigma_y2(i, j, 1, b) - my2
+                    sxy = sigma_xy(i, j, 1, b) - mx * my
+
+                    ! SSIM formula
+                    num = (2.0 * mx * my + SSIM_C1) * (2.0 * sxy + SSIM_C2)
+                    denom = (mx2 + my2 + SSIM_C1) * (sx2 + sy2 + SSIM_C2)
+
+                    ssim_map(i, j, 1, b) = num / denom
+                end do
+            end do
+        end do
+
+    end subroutine compute_ssim_map_kernel
+
+end module ssim_loss_module

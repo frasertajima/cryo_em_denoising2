@@ -1,0 +1,341 @@
+!================================================================
+! Cryo-EM Denoising Inference Program
+!================================================================
+! Loads trained CNN weights and runs inference on test data.
+! Outputs denoised images and computes quality metrics.
+!
+! Usage:
+!   ./cryo_inference --test_input test_input.bin \
+!                    --test_target test_target.bin \
+!                    --num_patches 100 \
+!                    --output denoised.bin
+!================================================================
+
+program cryo_inference
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    implicit none
+
+    ! cuDNN interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    ! Model parameters (must match training)
+    integer, parameter :: IMG_SIZE = 1024
+    integer, parameter :: IN_CHANNELS = 1
+    integer, parameter :: HIDDEN_CHANNELS = 16
+    integer, parameter :: OUT_CHANNELS = 1
+    integer, parameter :: KERNEL_SIZE = 3
+    integer, parameter :: PADDING = 1
+
+    ! Inference settings
+    character(len=512) :: test_input_file = '../data/cryo_data_streaming/test_input.bin'
+    character(len=512) :: test_target_file = '../data/cryo_data_streaming/test_target.bin'
+    character(len=512) :: output_file = 'denoised_output.bin'
+    character(len=512) :: weights_dir = ''
+    integer :: num_patches = 100
+    logical :: has_weights = .false.
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+
+    ! CNN layers
+    type(conv2d_layer_t) :: conv1, conv2, conv3
+
+    ! Data buffers
+    real(4), allocatable :: h_input(:,:)      ! (pixels, 1)
+    real(4), allocatable :: h_target(:,:)     ! (pixels, 1)
+    real(4), allocatable :: h_output(:,:)     ! (pixels, 1)
+    real(4), device, allocatable :: d_input(:,:,:,:)
+    real(4), device, allocatable :: d_hidden1(:,:,:,:)
+    real(4), device, allocatable :: d_hidden2(:,:,:,:)
+    real(4), device, allocatable :: d_output(:,:,:,:)
+
+    ! Metrics
+    real(8) :: total_mse_noisy, total_mse_denoised
+    real(8) :: total_psnr_noisy, total_psnr_denoised
+    real(8) :: patch_mse, patch_psnr
+    real(4) :: max_val
+
+    integer :: istat, patch_idx, i, j
+    integer :: input_unit, target_unit, output_unit
+    integer :: pixels_per_patch
+
+    ! Parse command line
+    call parse_args()
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Cryo-EM CNN Inference"
+    print *, "=============================================="
+    print '(A,A)', "  Test input:  ", trim(test_input_file)
+    print '(A,A)', "  Test target: ", trim(test_target_file)
+    print '(A,I8)', "  Num patches: ", num_patches
+    if (has_weights) then
+        print '(A,A)', "  Weights:     ", trim(weights_dir)
+    else
+        print *, "  Weights:     (random - no pretrained weights)"
+    endif
+    print '(A,A)', "  Output:      ", trim(output_file)
+    print *, ""
+
+    ! Initialize cuDNN
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+
+    ! Initialize CNN layers (batch_size=1 for inference)
+    call conv2d_init(conv1, cudnn_handle, IN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, 1, IMG_SIZE, IMG_SIZE, .true.)
+    call conv2d_init(conv2, cudnn_handle, HIDDEN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, 1, IMG_SIZE, IMG_SIZE, .true.)
+    call conv2d_init(conv3, cudnn_handle, HIDDEN_CHANNELS, OUT_CHANNELS, KERNEL_SIZE, &
+                     PADDING, 1, 1, IMG_SIZE, IMG_SIZE, .false.)
+
+    ! Load weights if provided
+    if (has_weights) then
+        call load_weights()
+        print *, "  Weights loaded successfully"
+    else
+        print *, "  Using random weights (for testing pipeline)"
+    endif
+
+    ! Allocate buffers
+    pixels_per_patch = IMG_SIZE * IMG_SIZE
+    allocate(h_input(pixels_per_patch, 1))
+    allocate(h_target(pixels_per_patch, 1))
+    allocate(h_output(pixels_per_patch, 1))
+    allocate(d_input(IMG_SIZE, IMG_SIZE, 1, 1))
+    allocate(d_hidden1(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, 1))
+    allocate(d_hidden2(IMG_SIZE, IMG_SIZE, HIDDEN_CHANNELS, 1))
+    allocate(d_output(IMG_SIZE, IMG_SIZE, 1, 1))
+
+    ! Open files
+    open(newunit=input_unit, file=trim(test_input_file), status='old', &
+         access='stream', form='unformatted', iostat=istat)
+    if (istat /= 0) then
+        print *, "ERROR: Cannot open input file"
+        stop 1
+    endif
+
+    open(newunit=target_unit, file=trim(test_target_file), status='old', &
+         access='stream', form='unformatted', iostat=istat)
+    if (istat /= 0) then
+        print *, "ERROR: Cannot open target file"
+        stop 1
+    endif
+
+    open(newunit=output_unit, file=trim(output_file), status='replace', &
+         access='stream', form='unformatted')
+
+    ! Initialize metrics
+    total_mse_noisy = 0.0d0
+    total_mse_denoised = 0.0d0
+    total_psnr_noisy = 0.0d0
+    total_psnr_denoised = 0.0d0
+
+    print *, "  Processing patches..."
+    print *, ""
+
+    ! Process each patch
+    do patch_idx = 1, num_patches
+        ! Read input and target
+        read(input_unit) h_input(:, 1)
+        read(target_unit) h_target(:, 1)
+
+        ! Copy to device (reshape to 4D)
+        do j = 1, IMG_SIZE
+            do i = 1, IMG_SIZE
+                d_input(i, j, 1, 1) = h_input((j-1)*IMG_SIZE + i, 1)
+            end do
+        end do
+
+        ! Forward pass
+        call conv2d_forward(conv1, d_input, d_hidden1)
+        call relu_forward(d_hidden1)
+        call conv2d_forward(conv2, d_hidden1, d_hidden2)
+        call relu_forward(d_hidden2)
+        call conv2d_forward(conv3, d_hidden2, d_output)
+
+        ! Copy output to host
+        istat = cudaDeviceSynchronize()
+        do j = 1, IMG_SIZE
+            do i = 1, IMG_SIZE
+                h_output((j-1)*IMG_SIZE + i, 1) = d_output(i, j, 1, 1)
+            end do
+        end do
+
+        ! Write denoised output
+        write(output_unit) h_output(:, 1)
+
+        ! Compute metrics
+        max_val = maxval(h_target(:, 1))
+
+        ! MSE: noisy vs target
+        patch_mse = sum((dble(h_input(:,1)) - dble(h_target(:,1)))**2) / pixels_per_patch
+        total_mse_noisy = total_mse_noisy + patch_mse
+        patch_psnr = 10.0d0 * log10(dble(max_val)**2 / patch_mse)
+        total_psnr_noisy = total_psnr_noisy + patch_psnr
+
+        ! MSE: denoised vs target
+        patch_mse = sum((dble(h_output(:,1)) - dble(h_target(:,1)))**2) / pixels_per_patch
+        total_mse_denoised = total_mse_denoised + patch_mse
+        patch_psnr = 10.0d0 * log10(dble(max_val)**2 / patch_mse)
+        total_psnr_denoised = total_psnr_denoised + patch_psnr
+
+        ! Progress
+        if (mod(patch_idx, 10) == 0 .or. patch_idx == 1) then
+            print '(A,I5,A,I5,A,F8.4,A,F8.4)', "  Patch ", patch_idx, "/", num_patches, &
+                  " | Noisy PSNR: ", total_psnr_noisy / patch_idx, &
+                  " | Denoised PSNR: ", total_psnr_denoised / patch_idx
+        endif
+    end do
+
+    ! Close files
+    close(input_unit)
+    close(target_unit)
+    close(output_unit)
+
+    ! Final metrics
+    print *, ""
+    print *, "=============================================="
+    print *, "  Results Summary"
+    print *, "=============================================="
+    print '(A,F10.6)', "  Avg Noisy MSE:     ", total_mse_noisy / num_patches
+    print '(A,F10.6)', "  Avg Denoised MSE:  ", total_mse_denoised / num_patches
+    print '(A,F10.4,A)', "  Avg Noisy PSNR:    ", total_psnr_noisy / num_patches, " dB"
+    print '(A,F10.4,A)', "  Avg Denoised PSNR: ", total_psnr_denoised / num_patches, " dB"
+    print '(A,F10.4,A)', "  PSNR Improvement:  ", (total_psnr_denoised - total_psnr_noisy) / num_patches, " dB"
+    print *, ""
+    print '(A,A)', "  Output saved to: ", trim(output_file)
+    print *, "=============================================="
+
+    ! Cleanup
+    deallocate(h_input, h_target, h_output)
+    deallocate(d_input, d_hidden1, d_hidden2, d_output)
+    call conv2d_cleanup(conv1)
+    call conv2d_cleanup(conv2)
+    call conv2d_cleanup(conv3)
+    istat = cudnnDestroy(cudnn_handle)
+
+contains
+
+    subroutine relu_forward(x)
+        real(4), device, intent(inout) :: x(:,:,:,:)
+        integer :: b, c, h, w, ws, hs, cs, bs
+
+        ws = size(x, 1)
+        hs = size(x, 2)
+        cs = size(x, 3)
+        bs = size(x, 4)
+
+        !$cuf kernel do(4) <<< *, * >>>
+        do b = 1, bs
+            do c = 1, cs
+                do h = 1, hs
+                    do w = 1, ws
+                        if (x(w, h, c, b) < 0.0) x(w, h, c, b) = 0.0
+                    end do
+                end do
+            end do
+        end do
+    end subroutine relu_forward
+
+    subroutine load_weights()
+        character(len=512) :: filename
+        real(4), allocatable :: h_weights(:,:,:,:), h_bias(:)
+        integer :: unit_num
+
+        ! Conv1
+        allocate(h_weights(HIDDEN_CHANNELS, IN_CHANNELS, KERNEL_SIZE, KERNEL_SIZE))
+        allocate(h_bias(HIDDEN_CHANNELS))
+        write(filename, '(A,A)') trim(weights_dir), 'conv1_weights.bin'
+        open(newunit=unit_num, file=trim(filename), status='old', access='stream', form='unformatted')
+        read(unit_num) h_weights
+        close(unit_num)
+        write(filename, '(A,A)') trim(weights_dir), 'conv1_bias.bin'
+        open(newunit=unit_num, file=trim(filename), status='old', access='stream', form='unformatted')
+        read(unit_num) h_bias
+        close(unit_num)
+        conv1%weights = h_weights
+        conv1%bias = h_bias
+        deallocate(h_weights, h_bias)
+
+        ! Conv2
+        allocate(h_weights(HIDDEN_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, KERNEL_SIZE))
+        allocate(h_bias(HIDDEN_CHANNELS))
+        write(filename, '(A,A)') trim(weights_dir), 'conv2_weights.bin'
+        open(newunit=unit_num, file=trim(filename), status='old', access='stream', form='unformatted')
+        read(unit_num) h_weights
+        close(unit_num)
+        write(filename, '(A,A)') trim(weights_dir), 'conv2_bias.bin'
+        open(newunit=unit_num, file=trim(filename), status='old', access='stream', form='unformatted')
+        read(unit_num) h_bias
+        close(unit_num)
+        conv2%weights = h_weights
+        conv2%bias = h_bias
+        deallocate(h_weights, h_bias)
+
+        ! Conv3
+        allocate(h_weights(OUT_CHANNELS, HIDDEN_CHANNELS, KERNEL_SIZE, KERNEL_SIZE))
+        allocate(h_bias(OUT_CHANNELS))
+        write(filename, '(A,A)') trim(weights_dir), 'conv3_weights.bin'
+        open(newunit=unit_num, file=trim(filename), status='old', access='stream', form='unformatted')
+        read(unit_num) h_weights
+        close(unit_num)
+        write(filename, '(A,A)') trim(weights_dir), 'conv3_bias.bin'
+        open(newunit=unit_num, file=trim(filename), status='old', access='stream', form='unformatted')
+        read(unit_num) h_bias
+        close(unit_num)
+        conv3%weights = h_weights
+        conv3%bias = h_bias
+        deallocate(h_weights, h_bias)
+
+    end subroutine load_weights
+
+    subroutine parse_args()
+        character(len=256) :: arg
+        integer :: i, num_args
+
+        num_args = command_argument_count()
+        i = 1
+        do while (i <= num_args)
+            call get_command_argument(i, arg)
+
+            if (trim(arg) == '--test_input') then
+                i = i + 1
+                call get_command_argument(i, test_input_file)
+            else if (trim(arg) == '--test_target') then
+                i = i + 1
+                call get_command_argument(i, test_target_file)
+            else if (trim(arg) == '--output') then
+                i = i + 1
+                call get_command_argument(i, output_file)
+            else if (trim(arg) == '--weights') then
+                i = i + 1
+                call get_command_argument(i, weights_dir)
+                has_weights = .true.
+            else if (trim(arg) == '--num_patches') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                read(arg, *) num_patches
+            endif
+
+            i = i + 1
+        end do
+    end subroutine parse_args
+
+end program cryo_inference

@@ -1,0 +1,179 @@
+!================================================================
+! Fourier Loss Module for Cryo-EM Denoising
+!================================================================
+! Provides power spectrum-based loss for enhanced high-frequency
+! detail preservation in cryo-EM denoising.
+!
+! Key functions:
+!   - init_fourier_loss: Create FFT plans
+!   - compute_fourier_loss: MSE in power spectrum domain
+!   - destroy_fourier_loss: Cleanup
+!
+! Usage:
+!   call init_fourier_loss(width, height, batch_size)
+!   call compute_fourier_loss(pred, target, loss)
+!   call destroy_fourier_loss()
+!================================================================
+
+module fourier_loss_module
+    use cudafor
+    use cufft
+    implicit none
+
+    ! Module state
+    integer, save :: fl_width = 0
+    integer, save :: fl_height = 0
+    integer, save :: fl_batch = 0
+    integer, save :: fl_freq_width = 0  ! width/2 + 1 for R2C
+
+    ! FFT plans (one per batch element for now - simple approach)
+    integer, save :: fft_plan = 0
+
+    ! Work buffers
+    complex(4), device, allocatable, save :: d_freq_pred(:,:)
+    complex(4), device, allocatable, save :: d_freq_target(:,:)
+    real(4), device, allocatable, save :: d_power_pred(:,:)
+    real(4), device, allocatable, save :: d_power_target(:,:)
+    real(4), device, allocatable, save :: d_power_diff(:,:)
+
+    ! Host buffer for loss reduction
+    real(4), allocatable, save :: h_power_diff(:,:)
+
+contains
+
+    !----------------------------------------
+    ! Initialize FFT plans and buffers
+    !----------------------------------------
+    subroutine init_fourier_loss(width, height)
+        integer, intent(in) :: width, height
+        integer :: istat
+
+        fl_width = width
+        fl_height = height
+        fl_freq_width = width / 2 + 1
+
+        ! Allocate work buffers (single image at a time)
+        allocate(d_freq_pred(fl_freq_width, fl_height))
+        allocate(d_freq_target(fl_freq_width, fl_height))
+        allocate(d_power_pred(fl_freq_width, fl_height))
+        allocate(d_power_target(fl_freq_width, fl_height))
+        allocate(d_power_diff(fl_freq_width, fl_height))
+        allocate(h_power_diff(fl_freq_width, fl_height))
+
+        ! Create FFT plan
+        istat = cufftPlan2d(fft_plan, fl_height, fl_width, CUFFT_R2C)
+        if (istat /= 0) then
+            print *, "ERROR: cufftPlan2d failed in init_fourier_loss"
+            stop 1
+        end if
+
+        print *, "Fourier loss initialized:"
+        print '(A,I5,A,I5)', "  Image size: ", width, " x ", height
+        print '(A,I5,A,I5)', "  Freq size:  ", fl_freq_width, " x ", height
+
+    end subroutine init_fourier_loss
+
+    !----------------------------------------
+    ! Compute Fourier loss for a batch
+    ! Averages power spectrum MSE over batch
+    !----------------------------------------
+    subroutine compute_fourier_loss(pred_flat, target_flat, batch_size, loss)
+        real(4), device, intent(in) :: pred_flat(:,:)    ! (W*H, N)
+        real(4), device, intent(in) :: target_flat(:,:)  ! (W*H, N)
+        integer, intent(in) :: batch_size
+        real(4), intent(out) :: loss
+
+        integer :: b, i, j, idx, istat
+        real(4) :: batch_loss, img_loss
+        real(4), device, allocatable :: d_img(:,:)
+        integer :: total_freq
+
+        total_freq = fl_freq_width * fl_height
+        allocate(d_img(fl_width, fl_height))
+
+        batch_loss = 0.0
+
+        do b = 1, batch_size
+            ! Reshape flat prediction to 2D and FFT
+            !$cuf kernel do(2) <<< *, * >>>
+            do j = 1, fl_height
+                do i = 1, fl_width
+                    idx = (j - 1) * fl_width + i
+                    d_img(i, j) = pred_flat(idx, b)
+                end do
+            end do
+
+            istat = cufftExecR2C(fft_plan, d_img, d_freq_pred)
+
+            ! Reshape flat target to 2D and FFT
+            !$cuf kernel do(2) <<< *, * >>>
+            do j = 1, fl_height
+                do i = 1, fl_width
+                    idx = (j - 1) * fl_width + i
+                    d_img(i, j) = target_flat(idx, b)
+                end do
+            end do
+
+            istat = cufftExecR2C(fft_plan, d_img, d_freq_target)
+
+            ! Compute log power spectra (standard spectral loss)
+            ! Use log(1 + |F|^2) to avoid log(0) and normalize scale
+            !$cuf kernel do(2) <<< *, * >>>
+            do j = 1, fl_height
+                do i = 1, fl_freq_width
+                    d_power_pred(i, j) = log(1.0 + real(d_freq_pred(i, j))**2 + &
+                                         aimag(d_freq_pred(i, j))**2)
+                    d_power_target(i, j) = log(1.0 + real(d_freq_target(i, j))**2 + &
+                                           aimag(d_freq_target(i, j))**2)
+                end do
+            end do
+            istat = cudaDeviceSynchronize()
+
+            ! Copy to host and compute MSE of log power spectra
+            h_power_diff = d_power_pred
+            block
+                real(4), allocatable :: h_power_tgt(:,:)
+                allocate(h_power_tgt(fl_freq_width, fl_height))
+                h_power_tgt = d_power_target
+
+                ! MSE of log power spectra (already normalized by log scale)
+                img_loss = sum((h_power_diff - h_power_tgt)**2) / real(total_freq)
+
+                deallocate(h_power_tgt)
+            end block
+
+            batch_loss = batch_loss + img_loss
+        end do
+
+        deallocate(d_img)
+
+        loss = batch_loss / real(batch_size)
+
+    end subroutine compute_fourier_loss
+
+    !----------------------------------------
+    ! Cleanup
+    !----------------------------------------
+    subroutine destroy_fourier_loss()
+        integer :: istat
+
+        if (fft_plan /= 0) then
+            istat = cufftDestroy(fft_plan)
+            fft_plan = 0
+        end if
+
+        if (allocated(d_freq_pred)) deallocate(d_freq_pred)
+        if (allocated(d_freq_target)) deallocate(d_freq_target)
+        if (allocated(d_power_pred)) deallocate(d_power_pred)
+        if (allocated(d_power_target)) deallocate(d_power_target)
+        if (allocated(d_power_diff)) deallocate(d_power_diff)
+        if (allocated(h_power_diff)) deallocate(h_power_diff)
+
+        fl_width = 0
+        fl_height = 0
+
+        print *, "Fourier loss cleaned up"
+
+    end subroutine destroy_fourier_loss
+
+end module fourier_loss_module
