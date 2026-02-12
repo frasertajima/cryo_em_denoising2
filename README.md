@@ -230,7 +230,7 @@ The 12-layer residual CNN provides the best balance of noise removal and structu
 ### Tested Configuration
 - **GPU**: NVIDIA RTX 4060 Ti (8GB)
 - **RAM**: 32GB system memory
-- **Storage**: 100GB for dataset
+- **Storage**: 1TB for dataset
 - **Training time**: ~4 hours (5 epochs)
 
 ### Minimum Requirements
