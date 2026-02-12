@@ -1,22 +1,31 @@
 # Cryo-EM Denoising with Deep Residual CNN (CUDA Fortran)
 
 **Status**: ✅ **PRODUCTION READY**  
-**Achievement**: 12-layer residual CNN achieves +4.1 dB PSNR improvement with excellent structure preservation
+**Achievement**: Noise2Noise training on real cryo-EM data reveals protein particles invisible in raw images
 
 ---
 
 ## Overview
 
-This project implements a **12-layer deep residual CNN** for cryo-EM image denoising in **CUDA Fortran**. The network uses residual learning (predicting noise and subtracting it) to achieve state-of-the-art denoising while preserving structural details critical for particle identification.
+This project implements a **12-layer deep residual CNN** for cryo-EM image denoising in **CUDA Fortran**. The network uses residual learning (predicting noise and subtracting it) combined with **Noise2Noise training** on real cryo-EM movie data.
 
-### Key Results
+### Breakthrough Results on Real Data (EMPIAR-10025)
+
+| Metric | Raw Half-Set | Denoised | Improvement |
+|--------|--------------|----------|-------------|
+| **Odd/Even Correlation** | 0.067 | 0.879 | **13x improvement** |
+| **PSNR** | baseline | +2.82 dB | Averaged over 10 movies |
+| **SSIM** | baseline | +0.109 | Structural similarity |
+| **Removed Noise Correlation** | - | 0.024 | Confirms real noise removal |
+
+**The denoised images reveal protein particles that are completely invisible in the raw data** - both odd and even frame averages show only noise, but the denoised version clearly shows individual T20S Proteasome particles scattered across the ice.
+
+### Synthetic Data Results
 
 | Metric | Noisy Input | Denoised | Improvement |
 |--------|-------------|----------|-------------|
 | **PSNR** | 12.81 dB | 16.90 dB | **+4.09 dB** |
 | **Edge Preservation** | - | 55.9% | Structures visible |
-
-**The denoised images are cleaner than the ground truth while preserving structures** - making particle identification significantly easier.
 
 ---
 
@@ -49,13 +58,30 @@ Output = Input - Predicted Noise (Residual Connection)
 
 ## Training Results
 
+### Real Data: Noise2Noise on EMPIAR-10025 (T20S Proteasome)
+
+```
+Dataset: 200 raw movie stacks (395 GB)
+Training: 35,150 patches (64×64) from odd/even frame splitting
+Validation: 3,906 patches
+
+Epoch 1:  Val Loss 0.000342 (new best)
+Epoch 4:  Val Loss 0.000341 (new best)
+Epoch 5:  Val Loss 0.000340 (new best)
+Epoch 9:  Val Loss 0.000339 (new best) ← Final model
+Epoch 10: Val Loss 0.000341
+```
+
+- **Training time**: ~10 minutes total for 10 epochs
+- **395GB dataset** processed with only 2MB buffer memory
+- **Verification**: Denoised odd/even correlation: 0.879 (raw: 0.067)
+
+### Synthetic Data: Supervised Training
+
 Training on 10,309 patches (1024×1024) with σ=0.25 Gaussian noise:
 
 ```
 Epoch 1: Val Loss 0.0207, Val RMSE 0.144
-Epoch 2: Val Loss 0.0205, Val RMSE 0.143
-Epoch 3: Val Loss 0.0205, Val RMSE 0.143
-Epoch 4: Val Loss 0.0205, Val RMSE 0.143
 Epoch 5: Val Loss 0.0205, Val RMSE 0.143  ← Best model
 ```
 
@@ -74,18 +100,37 @@ Epoch 5: Val Loss 0.0205, Val RMSE 0.143  ← Best model
 - cuDNN library
 - Python 3.8+ with PyTorch (for evaluation)
 
-### Training
+### Training on Real Data (Noise2Noise)
+
+```bash
+# Preprocess movie stacks (creates odd/even frame pairs)
+python tools/preprocess_n2n_movies.py \
+    --input_dir /path/to/raw/movies \
+    --output_dir data/real_n2n \
+    --patch_size 64 --stride 128
+
+# Train
+cd v33_deep_residual
+make cryo_train_n2n
+./cryo_train_n2n \
+    --train_file ../data/real_n2n/train_n2n.bin \
+    --val_file ../data/real_n2n/val_n2n.bin \
+    --epochs 10 --batch_size 32 --save
+```
+
+### Training on Synthetic Data (Supervised)
 
 ```bash
 cd v33_deep_residual
-make
+make cryo_train_deep
 ./cryo_train_deep --stream --epochs 5 --data_dir ../data/cryo_high_noise/ --save
 ```
 
 ### Evaluation
 
 ```bash
-python evaluate_deep_torch.py
+# Interactive Jupyter notebook with verification tests
+jupyter notebook notebooks/evaluate_n2n_real.ipynb
 ```
 
 ---
@@ -95,27 +140,29 @@ python evaluate_deep_torch.py
 ```
 cryo_em_v2/
 ├── v33_deep_residual/           # Main implementation (12-layer CNN)
-│   ├── cryo_train_deep.cuf      # Training program
+│   ├── cryo_train_n2n.cuf       # Noise2Noise training (real data)
+│   ├── cryo_train_deep.cuf      # Supervised training (synthetic)
+│   ├── streaming_n2n_loader.cuf # N2N streaming data loader
+│   ├── streaming_cryo_loader.cuf # Original streaming loader
 │   ├── conv2d_cudnn.cuf         # cuDNN convolution wrapper
-│   ├── streaming_cryo_loader.cuf # Streaming data loader
-│   ├── evaluate_deep_torch.py   # PyTorch evaluation script
 │   ├── Makefile
-│   ├── saved_models/deep12/     # Trained weights
-│   │   └── epoch_0005/          # Best model (93K params)
-│   └── evaluation_results/      # PSNR/SSIM metrics, visualizations
+│   └── saved_models/
+│       ├── n2n_real/epoch_0009/ # Best N2N model (real data)
+│       └── deep12/epoch_0005/   # Best supervised model (synthetic)
 │
-├── data/
-│   ├── cryo_high_noise/         # High-noise dataset (σ=0.25)
-│   │   ├── train_input.bin      # Noisy training patches
-│   │   ├── train_target.bin     # Clean training patches
-│   │   ├── test_input.bin       # Noisy test patches
-│   │   └── test_target.bin      # Clean test patches
-│   └── empiar_10025_subset/     # Original EMPIAR data
+├── notebooks/
+│   └── evaluate_n2n_real.ipynb  # Evaluation with verification tests
 │
-├── v31_perceptual_loss/         # Perceptual loss experiments (SSIM, gradient)
-├── v32_architecture_tests/      # A/B testing different architectures
-├── tools/                       # Data preprocessing scripts
-└── notebooks/                   # Jupyter analysis notebooks
+├── tools/
+│   ├── preprocess_n2n_movies.py # Movie stack → N2N training pairs
+│   └── download_empiar_10025.sh # Download EMPIAR data
+│
+├── data/                        # Training data (not in repo)
+│   ├── real_n2n/               # Preprocessed N2N pairs
+│   └── cryo_high_noise/        # Synthetic noisy/clean pairs
+│
+├── v31_perceptual_loss/         # Perceptual loss experiments
+└── v32_architecture_tests/      # Architecture A/B testing
 ```
 
 ---

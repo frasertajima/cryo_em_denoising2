@@ -1,0 +1,423 @@
+!================================================================
+! Streaming Noise2Noise Data Loader Module
+!================================================================
+! Loader for N2N binary format with interleaved input/target pairs
+!
+! File Format:
+!   - Header (16 bytes): n_samples(i4), height(i4), width(i4), channels(i4)
+!   - Per sample: input(h*w*4 bytes), target(h*w*4 bytes)
+!
+! Usage:
+!   1. call n2n_loader_init(filename, batch_size)
+!   2. call n2n_loader_start_epoch()
+!   3. call n2n_loader_get_batch(batch_input, batch_target, n)
+!   4. call n2n_loader_cleanup()
+!================================================================
+module streaming_n2n_loader
+    use cudafor
+    implicit none
+
+    integer, parameter, public :: N2N_SHUFFLE_NONE = 0
+    integer, parameter, public :: N2N_SHUFFLE_BLOCK = 1
+    integer, parameter, public :: N2N_SHUFFLE_FULL = 2
+
+    integer, parameter :: DEFAULT_BLOCK_SIZE = 100
+    integer, parameter :: HEADER_SIZE = 16  ! 4 integers
+
+    !----------------------------------------------------------------
+    ! Double buffer structure
+    !----------------------------------------------------------------
+    type :: n2n_buffer_t
+        real(4), managed, allocatable :: input(:,:)   ! (patch_pixels, batch_size)
+        real(4), managed, allocatable :: target(:,:)  ! (patch_pixels, batch_size)
+        integer :: batch_idx
+        logical :: ready
+    end type n2n_buffer_t
+
+    !----------------------------------------------------------------
+    ! Module state
+    !----------------------------------------------------------------
+    type(n2n_buffer_t), target, private :: buffer_a, buffer_b
+    type(n2n_buffer_t), pointer, private :: current_buffer => null()
+    type(n2n_buffer_t), pointer, private :: loading_buffer => null()
+
+    integer, private :: data_unit = 400
+    character(len=512), private :: data_filename
+
+    integer, private :: total_samples
+    integer, private :: patch_height
+    integer, private :: patch_width
+    integer, private :: patch_channels
+    integer, private :: patch_pixels
+    integer, private :: batch_size
+    integer(8), private :: bytes_per_sample  ! input + target
+    integer, private :: total_batches
+
+    integer, private :: current_batch_idx
+    integer, allocatable, private :: sample_order(:)
+
+    integer, private :: shuffle_mode = N2N_SHUFFLE_BLOCK
+    integer, private :: block_size = DEFAULT_BLOCK_SIZE
+    logical, private :: is_initialized = .false.
+    logical, private :: file_open = .false.
+
+    public :: n2n_loader_init
+    public :: n2n_loader_start_epoch
+    public :: n2n_loader_get_batch
+    public :: n2n_loader_cleanup
+    public :: n2n_loader_set_shuffle
+    public :: n2n_loader_get_num_batches
+    public :: n2n_loader_get_total_samples
+    public :: n2n_loader_get_patch_size
+    public :: n2n_loader_is_ready
+
+contains
+
+    !================================================================
+    ! Initialize N2N streaming loader
+    !================================================================
+    subroutine n2n_loader_init(filename, batch_sz)
+        character(len=*), intent(in) :: filename
+        integer, intent(in) :: batch_sz
+
+        integer :: istat, header(4)
+        logical :: file_exists
+        integer(8) :: actual_size, expected_size
+
+        if (is_initialized) then
+            call n2n_loader_cleanup()
+        endif
+
+        ! Check file exists
+        inquire(file=filename, exist=file_exists, size=actual_size)
+        if (.not. file_exists) then
+            print *, ""
+            print *, "ERROR: N2N data file not found!"
+            print *, "  Missing: ", trim(filename)
+            stop 1
+        endif
+
+        ! Read header
+        open(unit=data_unit, file=trim(filename), form='unformatted', &
+             access='stream', status='old')
+        read(data_unit) header
+        close(data_unit)
+
+        total_samples = header(1)
+        patch_height = header(2)
+        patch_width = header(3)
+        patch_channels = header(4)
+        patch_pixels = patch_height * patch_width
+
+        ! Verify file size
+        bytes_per_sample = int(patch_pixels, 8) * 4_8 * 2_8  ! input + target
+        expected_size = HEADER_SIZE + int(total_samples, 8) * bytes_per_sample
+
+        if (actual_size /= expected_size) then
+            print *, ""
+            print *, "WARNING: File size mismatch!"
+            print '(A, I12)', "  Header samples:   ", total_samples
+            print '(A, F10.2, A)', "  Expected size:    ", real(expected_size) / (1024.0**2), " MB"
+            print '(A, F10.2, A)', "  Actual size:      ", real(actual_size) / (1024.0**2), " MB"
+        endif
+
+        ! Store parameters
+        data_filename = filename
+        batch_size = batch_sz
+        total_batches = (total_samples + batch_sz - 1) / batch_sz
+
+        ! Allocate double buffers
+        allocate(buffer_a%input(patch_pixels, batch_sz), stat=istat)
+        allocate(buffer_a%target(patch_pixels, batch_sz), stat=istat)
+        allocate(buffer_b%input(patch_pixels, batch_sz), stat=istat)
+        allocate(buffer_b%target(patch_pixels, batch_sz), stat=istat)
+
+        if (istat /= 0) then
+            print *, "ERROR: Failed to allocate double buffers"
+            stop 1
+        endif
+
+        buffer_a%ready = .false.
+        buffer_a%batch_idx = 0
+        buffer_b%ready = .false.
+        buffer_b%batch_idx = 0
+
+        allocate(sample_order(total_samples))
+
+        current_buffer => buffer_a
+        loading_buffer => buffer_b
+
+        is_initialized = .true.
+
+        print *, ""
+        print *, "=========================================="
+        print *, "  N2N Streaming Loader Initialized"
+        print *, "=========================================="
+        print '(A, A)', "  Data file:      ", trim(filename)
+        print '(A, I12)', "  Total samples:  ", total_samples
+        print '(A, I5, A, I5)', "  Patch size:     ", patch_height, " x ", patch_width
+        print '(A, I12)', "  Batch size:     ", batch_size
+        print '(A, I12)', "  Total batches:  ", total_batches
+        print '(A, F8.2, A)', "  Buffer memory:  ", &
+              real(4 * patch_pixels * batch_sz * 4) / (1024.0**2), " MB"
+        print *, "=========================================="
+        print *, ""
+
+    end subroutine n2n_loader_init
+
+    !================================================================
+    ! Start new epoch with shuffling
+    !================================================================
+    subroutine n2n_loader_start_epoch()
+        integer :: i, j, temp, block_idx, num_blocks
+        real(4) :: r
+
+        if (.not. is_initialized) then
+            print *, "ERROR: N2N loader not initialized"
+            return
+        endif
+
+        ! Close file if open
+        if (file_open) then
+            close(data_unit)
+        endif
+
+        ! Open binary file for streaming
+        open(unit=data_unit, file=trim(data_filename), form='unformatted', &
+             access='stream', status='old')
+        file_open = .true.
+
+        ! Initialize sample order (1, 2, 3, ...)
+        do i = 1, total_samples
+            sample_order(i) = i
+        end do
+
+        ! Shuffle based on mode
+        select case (shuffle_mode)
+        case (N2N_SHUFFLE_NONE)
+            ! Sequential - no shuffling
+
+        case (N2N_SHUFFLE_BLOCK)
+            ! Shuffle within blocks
+            num_blocks = (total_samples + block_size - 1) / block_size
+            do block_idx = 1, num_blocks
+                do i = min(block_idx * block_size, total_samples), (block_idx - 1) * block_size + 2, -1
+                    call random_number(r)
+                    j = (block_idx - 1) * block_size + 1 + int(r * real(i - (block_idx - 1) * block_size))
+                    temp = sample_order(i)
+                    sample_order(i) = sample_order(j)
+                    sample_order(j) = temp
+                end do
+            end do
+
+        case (N2N_SHUFFLE_FULL)
+            ! Full Fisher-Yates shuffle
+            do i = total_samples, 2, -1
+                call random_number(r)
+                j = 1 + int(r * real(i))
+                temp = sample_order(i)
+                sample_order(i) = sample_order(j)
+                sample_order(j) = temp
+            end do
+        end select
+
+        ! Reset state
+        current_batch_idx = 0
+        current_buffer => buffer_a
+        loading_buffer => buffer_b
+        buffer_a%ready = .false.
+        buffer_b%ready = .false.
+
+        ! Pre-load first batch synchronously
+        call load_batch_sync(current_buffer, 1)
+        current_buffer%ready = .true.
+        current_batch_idx = 1
+
+        ! Start load of second batch
+        if (total_batches > 1) then
+            call load_batch_sync(loading_buffer, 2)
+            loading_buffer%ready = .true.
+        endif
+
+    end subroutine n2n_loader_start_epoch
+
+    !================================================================
+    ! Get next batch
+    !================================================================
+    subroutine n2n_loader_get_batch(batch_input, batch_target, actual_size)
+        real(4), managed, intent(out) :: batch_input(:,:)
+        real(4), managed, intent(out) :: batch_target(:,:)
+        integer, intent(out) :: actual_size
+
+        type(n2n_buffer_t), pointer :: temp_ptr
+        integer :: next_batch_idx
+
+        if (.not. is_initialized) then
+            print *, "ERROR: N2N loader not initialized"
+            actual_size = 0
+            return
+        endif
+
+        if (current_batch_idx > total_batches) then
+            actual_size = 0
+            return
+        endif
+
+        ! Wait for current buffer to be ready
+        do while (.not. current_buffer%ready)
+        end do
+
+        ! Calculate actual batch size (last batch may be partial)
+        if (current_batch_idx == total_batches) then
+            actual_size = mod(total_samples - 1, batch_size) + 1
+        else
+            actual_size = batch_size
+        endif
+
+        ! Copy data from buffer to output
+        batch_input(:, 1:actual_size) = current_buffer%input(:, 1:actual_size)
+        batch_target(:, 1:actual_size) = current_buffer%target(:, 1:actual_size)
+
+        ! Advance to next batch
+        current_batch_idx = current_batch_idx + 1
+
+        ! Swap buffers
+        temp_ptr => current_buffer
+        current_buffer => loading_buffer
+        loading_buffer => temp_ptr
+        loading_buffer%ready = .false.
+
+        ! Load next batch
+        next_batch_idx = current_batch_idx + 1
+        if (next_batch_idx <= total_batches) then
+            call load_batch_sync(loading_buffer, next_batch_idx)
+            loading_buffer%ready = .true.
+        endif
+
+    end subroutine n2n_loader_get_batch
+
+    !================================================================
+    ! Load batch synchronously (reads samples by shuffled order)
+    !================================================================
+    subroutine load_batch_sync(buf, batch_idx)
+        type(n2n_buffer_t), intent(inout) :: buf
+        integer, intent(in) :: batch_idx
+
+        integer(8) :: file_pos
+        integer :: samples_in_batch, start_sample, end_sample
+        integer :: i, sample_idx, buf_idx
+        integer :: istat
+        real(4) :: temp_input(patch_pixels), temp_target(patch_pixels)
+
+        ! Calculate sample range for this batch
+        start_sample = (batch_idx - 1) * batch_size + 1
+        end_sample = min(batch_idx * batch_size, total_samples)
+        samples_in_batch = end_sample - start_sample + 1
+
+        ! Initialize to zero
+        buf%input = 0.0
+        buf%target = 0.0
+
+        ! Read each sample according to shuffled order
+        buf_idx = 0
+        do i = start_sample, end_sample
+            buf_idx = buf_idx + 1
+            sample_idx = sample_order(i)
+
+            ! Calculate file position: header + (sample_idx - 1) * bytes_per_sample
+            file_pos = HEADER_SIZE + int(sample_idx - 1, 8) * bytes_per_sample + 1_8
+
+            ! Read input patch
+            read(data_unit, pos=file_pos, iostat=istat) temp_input
+            if (istat /= 0) then
+                print *, "WARNING: Error reading input sample", sample_idx
+            endif
+            buf%input(:, buf_idx) = temp_input
+
+            ! Read target patch (immediately after input)
+            file_pos = file_pos + int(patch_pixels, 8) * 4_8
+            read(data_unit, pos=file_pos, iostat=istat) temp_target
+            if (istat /= 0) then
+                print *, "WARNING: Error reading target sample", sample_idx
+            endif
+            buf%target(:, buf_idx) = temp_target
+        end do
+
+        buf%batch_idx = batch_idx
+
+    end subroutine load_batch_sync
+
+    !================================================================
+    ! Set shuffle mode
+    !================================================================
+    subroutine n2n_loader_set_shuffle(mode, blk_size)
+        integer, intent(in) :: mode
+        integer, intent(in), optional :: blk_size
+
+        shuffle_mode = mode
+        if (present(blk_size)) then
+            block_size = blk_size
+        endif
+
+    end subroutine n2n_loader_set_shuffle
+
+    !================================================================
+    ! Get number of batches
+    !================================================================
+    function n2n_loader_get_num_batches() result(num)
+        integer :: num
+        num = total_batches
+    end function n2n_loader_get_num_batches
+
+    !================================================================
+    ! Get total samples
+    !================================================================
+    function n2n_loader_get_total_samples() result(num)
+        integer :: num
+        num = total_samples
+    end function n2n_loader_get_total_samples
+
+    !================================================================
+    ! Get patch size
+    !================================================================
+    function n2n_loader_get_patch_size() result(sz)
+        integer :: sz
+        sz = patch_height
+    end function n2n_loader_get_patch_size
+
+    !================================================================
+    ! Check if initialized
+    !================================================================
+    function n2n_loader_is_ready() result(ready)
+        logical :: ready
+        ready = is_initialized
+    end function n2n_loader_is_ready
+
+    !================================================================
+    ! Cleanup and free resources
+    !================================================================
+    subroutine n2n_loader_cleanup()
+
+        if (.not. is_initialized) return
+
+        if (file_open) then
+            close(data_unit)
+            file_open = .false.
+        endif
+
+        if (allocated(buffer_a%input)) deallocate(buffer_a%input)
+        if (allocated(buffer_a%target)) deallocate(buffer_a%target)
+        if (allocated(buffer_b%input)) deallocate(buffer_b%input)
+        if (allocated(buffer_b%target)) deallocate(buffer_b%target)
+        if (allocated(sample_order)) deallocate(sample_order)
+
+        nullify(current_buffer)
+        nullify(loading_buffer)
+
+        is_initialized = .false.
+
+        print *, "N2N streaming loader cleaned up"
+
+    end subroutine n2n_loader_cleanup
+
+end module streaming_n2n_loader

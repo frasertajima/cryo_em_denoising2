@@ -2,6 +2,9 @@
 data/cryo_data_streaming/
 data/cryo_high_noise/
 data/empiar_*/
+data/real_n2n/
+data/real_n2n_test/
+14sep05c_raw_196/
 *.mrc
 
 # Compiled binaries and object files
@@ -27,10 +30,12 @@ v29_*/saved_models/
 v30_*/saved_models/
 v31_*/saved_models/
 
-# Keep the final trained 12-layer model
+# Keep the final trained models
 !v33_deep_residual/saved_models/
 !v33_deep_residual/saved_models/deep12/
 !v33_deep_residual/saved_models/deep12/epoch_0005/
+!v33_deep_residual/saved_models/n2n_real/
+!v33_deep_residual/saved_models/n2n_real/epoch_0009/
 
 # IDE
 .vscode/

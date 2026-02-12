@@ -66,6 +66,7 @@ program cryo_train_perceptual
     integer :: max_batches = -1  ! -1 means all batches
     logical :: save_checkpoints = .false.
     character(len=256) :: checkpoint_dir = "saved_models/cryo_cnn_perceptual/"
+    character(len=256) :: data_dir = "../data/cryo_data_streaming/"
     real(4) :: val_split = 0.1  ! 10% for validation
 
     ! cuDNN handle
@@ -165,8 +166,8 @@ program cryo_train_perceptual
     endif
 
     ! Initialize streaming data loader
-    call cryo_loader_init('../data/cryo_data_streaming/train_input.bin', &
-                          '../data/cryo_data_streaming/train_target.bin', &
+    call cryo_loader_init(trim(data_dir) // 'train_input.bin', &
+                          trim(data_dir) // 'train_target.bin', &
                           10309, BATCH_SIZE)  ! Full dataset: 10,309 patches
     print *, "  Streaming data loader initialized"
 
@@ -749,6 +750,10 @@ contains
                 i = i + 1
                 call get_command_argument(i, arg)
                 checkpoint_dir = trim(arg) // "/"
+            else if (trim(arg) == '--data_dir') then
+                i = i + 1
+                call get_command_argument(i, arg)
+                data_dir = trim(arg) // "/"
             else if (trim(arg) == '--val_split') then
                 i = i + 1
                 call get_command_argument(i, arg)
